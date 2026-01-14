@@ -3,6 +3,7 @@ package panel
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"sync"
 
 	"dario.cat/mergo"
@@ -174,6 +175,10 @@ func (p *Panel) Start() {
 
 	// Load Nodes config
 	for _, nodeConfig := range p.panelConfig.NodesConfig {
+		// Normalize NodeType for compatibility with panel naming (e.g. Xboard uses "anytls").
+		if nodeConfig != nil && nodeConfig.ApiConfig != nil && strings.EqualFold(nodeConfig.ApiConfig.NodeType, "anytls") {
+			nodeConfig.ApiConfig.NodeType = "AnyTLS"
+		}
 		var apiClient api.API
 		switch nodeConfig.PanelType {
 		case "SSpanel":
@@ -201,7 +206,11 @@ func (p *Panel) Start() {
 				log.Panicf("Read Controller Config Failed")
 			}
 		}
-		controllerService = controller.New(server, apiClient, controllerConfig, nodeConfig.PanelType)
+		if apiClient.Describe().NodeType == "AnyTLS" {
+			controllerService = controller.NewSingBoxController(apiClient, controllerConfig, nodeConfig.PanelType)
+		} else {
+			controllerService = controller.New(server, apiClient, controllerConfig, nodeConfig.PanelType)
+		}
 		p.Service = append(p.Service, controllerService)
 
 	}

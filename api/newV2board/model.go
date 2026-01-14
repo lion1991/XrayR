@@ -8,6 +8,7 @@ type serverConfig struct {
 	shadowsocks
 	v2ray
 	trojan
+	anytls
 
 	ServerPort int `json:"server_port"`
 	BaseConfig struct {
@@ -58,6 +59,11 @@ type v2ray struct {
 type trojan struct {
 	Host       string `json:"host"`
 	ServerName string `json:"server_name"`
+}
+
+type anytls struct {
+	AnyTLSServerName string   `json:"server_name"`
+	PaddingScheme []string `json:"padding_scheme"`
 }
 
 type route struct {

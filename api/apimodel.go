@@ -78,6 +78,8 @@ type NodeInfo struct {
 	Security            string
 	Key                 string
 	RejectUnknownSni    bool
+	// AnyTLS related
+	PaddingScheme []string
 }
 
 type UserInfo struct {

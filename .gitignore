@@ -18,3 +18,4 @@ error.log
 .lego
 cert
 config.yml
+BUILD_DOCKER.md

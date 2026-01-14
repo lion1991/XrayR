@@ -190,6 +190,8 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		nodeInfo, err = c.parseTrojanNodeResponse(server)
 	case "Shadowsocks":
 		nodeInfo, err = c.parseSSNodeResponse(server)
+	case "AnyTLS":
+		nodeInfo, err = c.parseAnyTLSNodeResponse(server)
 	default:
 		return nil, fmt.Errorf("unsupported node type: %s", c.NodeType)
 	}
@@ -207,7 +209,7 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	path := "/api/v1/server/UniProxy/user"
 
 	switch c.NodeType {
-	case "V2ray", "Trojan", "Shadowsocks", "Vmess", "Vless":
+	case "V2ray", "Trojan", "Shadowsocks", "Vmess", "Vless", "AnyTLS":
 		break
 	default:
 		return nil, fmt.Errorf("unsupported node type: %s", c.NodeType)
@@ -253,7 +255,7 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 
 		u.DeviceLimit = c.DeviceLimit // todo waiting v2board send configuration
 		u.Email = u.UUID + "@v2board.user"
-		if c.NodeType == "Shadowsocks" {
+		if c.NodeType == "Shadowsocks" || c.NodeType == "AnyTLS" {
 			u.Passwd = u.UUID
 		}
 		userList[i] = u
@@ -328,6 +330,18 @@ func (c *APIClient) parseTrojanNodeResponse(s *serverConfig) (*api.NodeInfo, err
 		NameServerConfig:  s.parseDNSConfig(),
 	}
 	return nodeInfo, nil
+}
+
+func (c *APIClient) parseAnyTLSNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
+	return &api.NodeInfo{
+		NodeType:          c.NodeType,
+		NodeID:            c.NodeID,
+		Port:              uint32(s.ServerPort),
+		TransportProtocol: "tcp",
+		EnableTLS:         true,
+		PaddingScheme:     s.PaddingScheme,
+		NameServerConfig:  s.parseDNSConfig(),
+	}, nil
 }
 
 // parseSSNodeResponse parse the response for the given nodeInfo format
