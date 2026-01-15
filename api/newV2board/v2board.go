@@ -192,6 +192,8 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		nodeInfo, err = c.parseSSNodeResponse(server)
 	case "AnyTLS":
 		nodeInfo, err = c.parseAnyTLSNodeResponse(server)
+	case "Hysteria":
+		nodeInfo, err = c.parseHysteriaNodeResponse(server)
 	default:
 		return nil, fmt.Errorf("unsupported node type: %s", c.NodeType)
 	}
@@ -209,7 +211,7 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	path := "/api/v1/server/UniProxy/user"
 
 	switch c.NodeType {
-	case "V2ray", "Trojan", "Shadowsocks", "Vmess", "Vless", "AnyTLS":
+	case "V2ray", "Trojan", "Shadowsocks", "Vmess", "Vless", "AnyTLS", "Hysteria":
 		break
 	default:
 		return nil, fmt.Errorf("unsupported node type: %s", c.NodeType)
@@ -255,7 +257,7 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 
 		u.DeviceLimit = c.DeviceLimit // todo waiting v2board send configuration
 		u.Email = u.UUID + "@v2board.user"
-		if c.NodeType == "Shadowsocks" || c.NodeType == "AnyTLS" {
+		if c.NodeType == "Shadowsocks" || c.NodeType == "AnyTLS" || c.NodeType == "Hysteria" {
 			u.Passwd = u.UUID
 		}
 		userList[i] = u
@@ -341,6 +343,22 @@ func (c *APIClient) parseAnyTLSNodeResponse(s *serverConfig) (*api.NodeInfo, err
 		EnableTLS:         true,
 		PaddingScheme:     s.PaddingScheme,
 		NameServerConfig:  s.parseDNSConfig(),
+	}, nil
+}
+
+func (c *APIClient) parseHysteriaNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
+	return &api.NodeInfo{
+		NodeType:             c.NodeType,
+		NodeID:               c.NodeID,
+		Port:                 uint32(s.ServerPort),
+		TransportProtocol:    "udp",
+		EnableTLS:            true,
+		HysteriaVersion:      s.Version,
+		HysteriaObfs:         s.HysteriaObfs,
+		HysteriaObfsPassword: s.HysteriaObfsPwd,
+		HysteriaUpMbps:       s.UpMbps,
+		HysteriaDownMbps:     s.DownMbps,
+		NameServerConfig:     s.parseDNSConfig(),
 	}, nil
 }
 

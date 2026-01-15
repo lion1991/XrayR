@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 	sbdns "github.com/sagernet/sing-box/dns"
 	sboption "github.com/sagernet/sing-box/option"
 	sbanytls "github.com/sagernet/sing-box/protocol/anytls"
+	sbhysteria "github.com/sagernet/sing-box/protocol/hysteria"
+	sbhysteria2 "github.com/sagernet/sing-box/protocol/hysteria2"
 	"github.com/sagernet/sing/common/json/badoption"
 	log "github.com/sirupsen/logrus"
 	"github.com/xtls/xray-core/common/task"
@@ -145,7 +148,8 @@ func (c *SingBoxController) buildUserTag(user *api.UserInfo) string {
 }
 
 func (c *SingBoxController) startSingBox() error {
-	if c.nodeInfo.NodeType != "AnyTLS" {
+	nodeType := strings.ToLower(c.nodeInfo.NodeType)
+	if nodeType != "anytls" && nodeType != "hysteria" {
 		return fmt.Errorf("unsupported node type for sing-box controller: %s", c.nodeInfo.NodeType)
 	}
 	if c.nodeInfo.Port > 65535 {
@@ -171,7 +175,7 @@ func (c *SingBoxController) startSingBox() error {
 	var tlsOptions *sboption.InboundTLSOptions
 	if c.nodeInfo.EnableTLS {
 		if c.config.CertConfig == nil || c.config.CertConfig.CertMode == "none" {
-			return fmt.Errorf("anytls requires tls but CertConfig is not configured")
+			return fmt.Errorf("tls is required but CertConfig is not configured")
 		}
 		certFile, keyFile, err := getCertFile(c.config.CertConfig)
 		if err != nil {
@@ -184,34 +188,107 @@ func (c *SingBoxController) startSingBox() error {
 		}
 	}
 
-	users := make([]sboption.AnyTLSUser, 0, len(*c.userList))
-	for _, user := range *c.userList {
-		password := user.Passwd
-		if password == "" {
-			password = user.UUID
-		}
-		if password == "" {
-			return fmt.Errorf("anytls user %d has empty password/uuid", user.UID)
-		}
-		users = append(users, sboption.AnyTLSUser{
-			Name:     c.buildUserTag(&user),
-			Password: password,
-		})
-	}
-
-	inboundOptions := &sboption.AnyTLSInboundOptions{
-		ListenOptions: lo,
-		InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
-			TLS: tlsOptions,
-		},
-		Users: users,
-	}
-	if len(c.nodeInfo.PaddingScheme) > 0 {
-		inboundOptions.PaddingScheme = badoption.Listable[string](c.nodeInfo.PaddingScheme)
-	}
-
 	inReg := sbinbound.NewRegistry()
-	sbanytls.RegisterInbound(inReg)
+	var inboundType string
+	var inboundOptions any
+
+	switch nodeType {
+	case "anytls":
+		sbanytls.RegisterInbound(inReg)
+		users := make([]sboption.AnyTLSUser, 0, len(*c.userList))
+		for _, user := range *c.userList {
+			password := user.Passwd
+			if password == "" {
+				password = user.UUID
+			}
+			if password == "" {
+				return fmt.Errorf("anytls user %d has empty password/uuid", user.UID)
+			}
+			users = append(users, sboption.AnyTLSUser{
+				Name:     c.buildUserTag(&user),
+				Password: password,
+			})
+		}
+		anytlsOptions := &sboption.AnyTLSInboundOptions{
+			ListenOptions: lo,
+			InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
+				TLS: tlsOptions,
+			},
+			Users: users,
+		}
+		if len(c.nodeInfo.PaddingScheme) > 0 {
+			anytlsOptions.PaddingScheme = badoption.Listable[string](c.nodeInfo.PaddingScheme)
+		}
+		inboundType = sbc.TypeAnyTLS
+		inboundOptions = anytlsOptions
+	case "hysteria":
+		// choose hy1 or hy2 by version, default hy2 when version==2
+		version := c.nodeInfo.HysteriaVersion
+		if version == 2 {
+			sbhysteria2.RegisterInbound(inReg)
+			users := make([]sboption.Hysteria2User, 0, len(*c.userList))
+			for _, user := range *c.userList {
+				password := user.Passwd
+				if password == "" {
+					password = user.UUID
+				}
+				if password == "" {
+					return fmt.Errorf("hysteria2 user %d has empty password/uuid", user.UID)
+				}
+				users = append(users, sboption.Hysteria2User{
+					Name:     c.buildUserTag(&user),
+					Password: password,
+				})
+			}
+			var obfs *sboption.Hysteria2Obfs
+			if c.nodeInfo.HysteriaObfs != "" {
+				obfs = &sboption.Hysteria2Obfs{
+					Type:     c.nodeInfo.HysteriaObfs,
+					Password: c.nodeInfo.HysteriaObfsPassword,
+				}
+			}
+			h2Options := &sboption.Hysteria2InboundOptions{
+				ListenOptions: lo,
+				InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
+					TLS: tlsOptions,
+				},
+				UpMbps:   c.nodeInfo.HysteriaUpMbps,
+				DownMbps: c.nodeInfo.HysteriaDownMbps,
+				Obfs:     obfs,
+				Users:    users,
+			}
+			inboundType = sbc.TypeHysteria2
+			inboundOptions = h2Options
+		} else {
+			sbhysteria.RegisterInbound(inReg)
+			users := make([]sboption.HysteriaUser, 0, len(*c.userList))
+			for _, user := range *c.userList {
+				password := user.Passwd
+				if password == "" {
+					password = user.UUID
+				}
+				if password == "" {
+					return fmt.Errorf("hysteria user %d has empty password/uuid", user.UID)
+				}
+				users = append(users, sboption.HysteriaUser{
+					Name:       c.buildUserTag(&user),
+					AuthString: password,
+				})
+			}
+			hOptions := &sboption.HysteriaInboundOptions{
+				ListenOptions: lo,
+				InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
+					TLS: tlsOptions,
+				},
+				UpMbps:   c.nodeInfo.HysteriaUpMbps,
+				DownMbps: c.nodeInfo.HysteriaDownMbps,
+				Obfs:     c.nodeInfo.HysteriaObfs,
+				Users:    users,
+			}
+			inboundType = sbc.TypeHysteria
+			inboundOptions = hOptions
+		}
+	}
 
 	ctx := context.Background()
 	ctx = sb.Context(
@@ -231,7 +308,7 @@ func (c *SingBoxController) startSingBox() error {
 			},
 			Inbounds: []sboption.Inbound{
 				{
-					Type:    sbc.TypeAnyTLS,
+					Type:    inboundType,
 					Tag:     c.Tag,
 					Options: inboundOptions,
 				},

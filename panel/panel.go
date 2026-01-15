@@ -175,9 +175,14 @@ func (p *Panel) Start() {
 
 	// Load Nodes config
 	for _, nodeConfig := range p.panelConfig.NodesConfig {
-		// Normalize NodeType for compatibility with panel naming (e.g. Xboard uses "anytls").
-		if nodeConfig != nil && nodeConfig.ApiConfig != nil && strings.EqualFold(nodeConfig.ApiConfig.NodeType, "anytls") {
-			nodeConfig.ApiConfig.NodeType = "AnyTLS"
+		// Normalize NodeType for compatibility with panel naming (e.g. Xboard uses "anytls"/"hysteria").
+		if nodeConfig != nil && nodeConfig.ApiConfig != nil {
+			if strings.EqualFold(nodeConfig.ApiConfig.NodeType, "anytls") {
+				nodeConfig.ApiConfig.NodeType = "AnyTLS"
+			}
+			if strings.EqualFold(nodeConfig.ApiConfig.NodeType, "hysteria") || strings.EqualFold(nodeConfig.ApiConfig.NodeType, "hysteria2") {
+				nodeConfig.ApiConfig.NodeType = "Hysteria"
+			}
 		}
 		var apiClient api.API
 		switch nodeConfig.PanelType {
@@ -206,7 +211,8 @@ func (p *Panel) Start() {
 				log.Panicf("Read Controller Config Failed")
 			}
 		}
-		if apiClient.Describe().NodeType == "AnyTLS" {
+		nodeType := apiClient.Describe().NodeType
+		if strings.EqualFold(nodeType, "AnyTLS") || strings.EqualFold(nodeType, "Hysteria") {
 			controllerService = controller.NewSingBoxController(apiClient, controllerConfig, nodeConfig.PanelType)
 		} else {
 			controllerService = controller.New(server, apiClient, controllerConfig, nodeConfig.PanelType)

@@ -80,6 +80,12 @@ type NodeInfo struct {
 	RejectUnknownSni    bool
 	// AnyTLS related
 	PaddingScheme []string
+	// Hysteria / Hy2
+	HysteriaVersion      int
+	HysteriaObfs         string
+	HysteriaObfsPassword string
+	HysteriaUpMbps       int
+	HysteriaDownMbps     int
 }
 
 type UserInfo struct {

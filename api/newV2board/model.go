@@ -9,6 +9,7 @@ type serverConfig struct {
 	v2ray
 	trojan
 	anytls
+	hysteria
 
 	ServerPort int `json:"server_port"`
 	BaseConfig struct {
@@ -63,7 +64,16 @@ type trojan struct {
 
 type anytls struct {
 	AnyTLSServerName string   `json:"server_name"`
-	PaddingScheme []string `json:"padding_scheme"`
+	PaddingScheme    []string `json:"padding_scheme"`
+}
+
+type hysteria struct {
+	Version            int    `json:"version"`
+	HysteriaServerName string `json:"server_name"`
+	UpMbps             int    `json:"up_mbps"`
+	DownMbps           int    `json:"down_mbps"`
+	HysteriaObfs       string `json:"obfs"`
+	HysteriaObfsPwd    string `json:"obfs-password"`
 }
 
 type route struct {
