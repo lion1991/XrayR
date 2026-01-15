@@ -13,7 +13,7 @@
 
 A Xray backend framework that can easily support many panels.
 
-一个基于Xray的后端框架，支持V2ay,Trojan,Shadowsocks协议，极易扩展，支持多面板对接。
+一个基于Xray的后端框架，支持 V2ray/Vmess/Vless、Trojan、Shadowsocks、AnyTLS、Hysteria/Hysteria2 (hy2) 协议，极易扩展，支持多面板对接。
 
 如果您喜欢本项目，可以右上角点个star+watch，持续关注本项目的进展。
 
@@ -27,8 +27,9 @@ A Xray backend framework that can easily support many panels.
 ## 特点
 
 * 永久开源且免费。
-* 支持V2ray，Trojan， Shadowsocks多种协议。
-* 支持Vless和XTLS等新特性。
+* 支持 V2ray/Vmess/Vless、Trojan、Shadowsocks、AnyTLS、Hysteria/Hysteria2 (hy2) 等多种协议。
+* 支持 Vless/XTLS/REALITY 等新特性。
+* AnyTLS/Hysteria/Hysteria2 使用 sing-box 控制器。
 * 支持单实例对接多面板、多节点，无需重复启动。
 * 支持限制在线IP
 * 支持节点端口级别、用户级别限速。
@@ -53,17 +54,21 @@ A Xray backend framework that can easily support many panels.
 | 按照用户限速    | √     | √      | √           |
 | 自定义DNS    | √     | √      | √           |
 
+说明：AnyTLS/Hysteria/Hysteria2 由 sing-box 控制器提供支持，功能覆盖以面板下发配置及 sing-box 能力为准。
+
 ## 支持前端
 
 | 前端                                                     | v2ray | trojan | shadowsocks             |
 |--------------------------------------------------------|-------|--------|-------------------------|
 | sspanel-uim                                            | √     | √      | √ (单端口多用户和V2ray-Plugin) |
-| v2board                                                | √     | √      | √                       |
+| v2board / NewV2board                                   | √     | √      | √                       |
 | [PMPanel](https://github.com/ByteInternetHK/PMPanel)   | √     | √      | √                       |
 | [ProxyPanel](https://github.com/ProxyPanel/ProxyPanel) | √     | √      | √                       |
 | [WHMCS (V2RaySocks)](https://v2raysocks.doxtex.com/)   | √     | √      | √                       |
 | [GoV2Panel](https://github.com/pingProMax/gov2panel)   | √     | √      | √                       |
 | [BunPanel](https://github.com/pennyMorant/bunpanel-release)   | √     | √      | √                       |
+
+说明：AnyTLS/Hysteria/Hysteria2 当前通过 NewV2board（UniProxy API）下发配置；其它面板请以实际支持为准。
 
 ## 软件安装
 
@@ -105,5 +110,3 @@ wget -N https://raw.githubusercontent.com/XrayR-project/XrayR-release/master/ins
 ## Stargazers over time
 
 [![Stargazers over time](https://starchart.cc/XrayR-project/XrayR.svg)](https://starchart.cc/XrayR-project/XrayR)
-
-
