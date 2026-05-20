@@ -338,42 +338,104 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		content = new(session.Content)
 		ctx = session.ContextWithContent(ctx, content)
 	}
+	// Wrap the inbound link the way upstream xray-core's WrapLink does:
+	//
+	//   - reader gets wrapped in *buf.TimeoutWrapperReader so that any
+	//     reader (including Hysteria 2's *buf.SingleReader) satisfies
+	//     buf.TimeoutReader. The previous panic
+	//     ("*buf.SingleReader is not buf.TimeoutReader") came from this
+	//     assumption being violated;
+	//   - per-user stats counters are attached when policy says so;
+	//   - the Limiter rate writer is also applied here so that Hysteria
+	//     traffic — which never goes through getLink — still gets the
+	//     speed limit + per-user bucket bookkeeping that other protocols
+	//     get.
+	outbound = d.wrapDispatchLink(ctx, outbound)
+
 	sniffingRequest := content.SniffingRequest
+	// DispatchLink must be SYNCHRONOUS — the inbound (e.g. Hysteria 2
+	// server's Process) expects this call to block for the lifetime of
+	// the request. Returning early via goroutine causes the caller to
+	// tear the QUIC stream down before any payload bytes transit.
 	if !sniffingRequest.Enabled {
-		go d.routedDispatch(ctx, outbound, destination)
+		d.routedDispatch(ctx, outbound, destination)
 	} else {
-		// Sniffing needs a reader that supports ReadMultiBufferTimeout
-		// (the TimeoutReader interface). Hysteria 2's QUIC stream gives us
-		// a *buf.SingleReader which doesn't satisfy that — for those we
-		// skip sniffing rather than panic. The old code blindly asserted
-		// *pipe.Reader and crashed every Hysteria request.
-		tReader, ok := outbound.Reader.(buf.TimeoutReader)
-		if !ok {
-			go d.routedDispatch(ctx, outbound, destination)
-			return nil
+		cReader := &cachedReader{reader: outbound.Reader.(buf.TimeoutReader)}
+		outbound.Reader = cReader
+		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+		if err == nil {
+			content.Protocol = result.Protocol()
 		}
-		go func() {
-			cReader := &cachedReader{reader: tReader}
-			outbound.Reader = cReader
-			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
-			if err == nil {
-				content.Protocol = result.Protocol()
+		if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
+			domain := result.Domain()
+			errors.LogInfo(ctx, "sniffed domain: ", domain)
+			destination.Address = net.ParseAddress(domain)
+			if sniffingRequest.RouteOnly && result.Protocol() != "fakedns" {
+				ob.RouteTarget = destination
+			} else {
+				ob.Target = destination
 			}
-			if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
-				domain := result.Domain()
-				errors.LogInfo(ctx, "sniffed domain: ", domain)
-				destination.Address = net.ParseAddress(domain)
-				if sniffingRequest.RouteOnly && result.Protocol() != "fakedns" {
-					ob.RouteTarget = destination
-				} else {
-					ob.Target = destination
-				}
-			}
-			d.routedDispatch(ctx, outbound, destination)
-		}()
+		}
+		d.routedDispatch(ctx, outbound, destination)
 	}
 
 	return nil
+}
+
+// wrapDispatchLink is the mydispatcher equivalent of upstream xray-core's
+// dispatcher.WrapLink. The Dispatch path constructs both ends of the
+// link in getLink (which already does Limiter + stats wrapping). The
+// DispatchLink path receives an already-built link from the inbound, so
+// none of that wrapping has happened — we have to do it here for parity.
+func (d *DefaultDispatcher) wrapDispatchLink(ctx context.Context, link *transport.Link) *transport.Link {
+	// Always wrap the reader in a timeout-aware adapter so downstream
+	// code can do ReadMultiBufferTimeout regardless of the inbound's
+	// reader type. This is what makes sniffing work for QUIC streams.
+	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
+
+	sessionInbound := session.InboundFromContext(ctx)
+	if sessionInbound == nil || sessionInbound.User == nil || sessionInbound.User.Email == "" {
+		return link
+	}
+	user := sessionInbound.User
+
+	// Per-user speed limit + device limit, mirrored from getLink.
+	if d.Limiter != nil {
+		ip := ""
+		if sessionInbound.Source.Address != nil {
+			ip = sessionInbound.Source.Address.IP().String()
+		}
+		bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, ip)
+		if reject {
+			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
+			common.Close(link.Writer)
+			common.Interrupt(link.Reader)
+			return link
+		}
+		if ok {
+			link.Writer = d.Limiter.RateWriter(link.Writer, bucket)
+		}
+	}
+
+	// Stats counters (upload counted on reader, download on writer).
+	p := d.policy.ForLevel(user.Level)
+	if p.Stats.UserUplink {
+		name := "user>>>" + user.Email + ">>>traffic>>>uplink"
+		if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+			link.Reader.(*buf.TimeoutWrapperReader).Counter = c
+		}
+	}
+	if p.Stats.UserDownlink {
+		name := "user>>>" + user.Email + ">>>traffic>>>downlink"
+		if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+			link.Writer = &SizeStatWriter{
+				Counter: c,
+				Writer:  link.Writer,
+			}
+		}
+	}
+
+	return link
 }
 
 func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
