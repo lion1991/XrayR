@@ -146,9 +146,10 @@ func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router rou
 	return nil
 }
 
-// Type implements common.HasType for registering as a separate feature, not overriding core dispatcher.
+// Type implements common.HasType. Returns routing.DispatcherType() so
+// xray-core treats us as THE dispatcher (not a sibling feature).
 func (*DefaultDispatcher) Type() interface{} {
-	return Type()
+	return routing.DispatcherType()
 }
 
 // Start implements common.Runnable.
@@ -187,7 +188,6 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 
 	if user != nil && len(user.Email) > 0 {
 		// Speed Limit and Device Limit
-		errors.LogInfo(ctx, "mydispatcher: GetUserBucket tag=", sessionInbound.Tag, " email=", user.Email, " ip=", sessionInbound.Source.Address.IP().String())
 		bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
 		if reject {
 			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
