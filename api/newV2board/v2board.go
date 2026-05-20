@@ -378,7 +378,10 @@ func (c *APIClient) parseHysteriaNodeResponse(s *serverConfig) (*api.NodeInfo, e
 		TransportProtocol:    "udp",
 		EnableTLS:            true,
 		HysteriaVersion:      s.Version,
-		HysteriaObfs:         s.HysteriaObfs,
+		// Obfs comes from serverConfig.Obfs (top-level field), not the
+		// embedded hysteria.HysteriaObfs which is shadowed and unfilled
+		// due to the json tag conflict with shadowsocks.Obfs.
+		HysteriaObfs:         s.Obfs,
 		HysteriaObfsPassword: s.HysteriaObfsPwd,
 		HysteriaUpMbps:       s.UpMbps,
 		HysteriaDownMbps:     s.DownMbps,

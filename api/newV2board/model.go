@@ -11,6 +11,15 @@ type serverConfig struct {
 	anytls
 	hysteria
 
+	// Obfs is declared at the outer level on purpose — both `shadowsocks`
+	// and `hysteria` define an embedded `Obfs string \`json:"obfs"\``
+	// field, and Go's encoding/json ignores keys whose target is
+	// ambiguous between two same-depth embedded fields. By shadowing them
+	// from a less-deep struct level, this single field captures the JSON
+	// `obfs` value for whichever protocol the node speaks (the two are
+	// mutually exclusive in practice).
+	Obfs string `json:"obfs"`
+
 	ServerPort int `json:"server_port"`
 	BaseConfig struct {
 		PushInterval int `json:"push_interval"`
