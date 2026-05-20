@@ -589,10 +589,13 @@ func (c *Controller) userInfoMonitor() (err error) {
 		}
 	}
 
-	// Report Online info
+	// Report Online info — also log the empty case so we can tell apart
+	// "Limiter wasn't populated this tick" from "function never ran".
 	if onlineDevice, err := c.GetOnlineDevice(c.Tag); err != nil {
 		c.logger.Print(err)
-	} else if len(*onlineDevice) > 0 {
+	} else if len(*onlineDevice) == 0 {
+		c.logger.Print("Report 0 online users (limiter empty this tick)")
+	} else {
 		if err = c.apiClient.ReportNodeOnlineUsers(onlineDevice); err != nil {
 			c.logger.Print(err)
 		} else {
