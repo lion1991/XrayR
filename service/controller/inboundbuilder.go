@@ -123,6 +123,20 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 		// non-AEAD Shadowsocks is being deprecated in favor of VLESS
 		// Encryption). config.DisableIVCheck is now a no-op.
 
+	case "Hysteria":
+		// xray-core only supports Hysteria 2 (the project renamed the package
+		// but dropped v1 support). Refuse v1 nodes clearly so operators
+		// migrate rather than silently fail.
+		if nodeInfo.HysteriaVersion != 2 {
+			return nil, fmt.Errorf("xray-core only supports Hysteria 2; node has version=%d", nodeInfo.HysteriaVersion)
+		}
+		protocol = "hysteria"
+		proxySetting = &conf.HysteriaServerConfig{Version: 2}
+		// Force the transport to hysteria — overriding whatever TransportProtocol
+		// the panel sent (which is typically "tcp" or "udp"). Hysteria has its
+		// own QUIC-based transport in xray-core.
+		nodeInfo.TransportProtocol = "hysteria"
+
 	case "dokodemo-door":
 		protocol = "dokodemo-door"
 		proxySetting = struct {
@@ -133,7 +147,7 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 			NetworkList: []string{"tcp", "udp"},
 		}
 	default:
-		return nil, fmt.Errorf("unsupported node type: %s, Only support: V2ray, Trojan, Shadowsocks, and Shadowsocks-Plugin", nodeInfo.NodeType)
+		return nil, fmt.Errorf("unsupported node type: %s, Only support: V2ray, Trojan, Shadowsocks, Hysteria, and Shadowsocks-Plugin", nodeInfo.NodeType)
 	}
 
 	setting, err := json.Marshal(proxySetting)
@@ -152,6 +166,11 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 	}
 
 	switch networkType {
+	case "hysteria":
+		// Hysteria 2 transport (QUIC). Version is the only required field at
+		// build time; QUIC-level params would go under quicParams (we don't
+		// expose them yet).
+		streamSetting.HysteriaSettings = &conf.HysteriaConfig{Version: 2}
 	case "tcp":
 		tcpSetting := &conf.TCPConfig{
 			AcceptProxyProtocol: config.EnableProxyProtocol,

@@ -12,6 +12,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
+	"github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
 	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"github.com/xtls/xray-core/proxy/trojan"
@@ -54,6 +55,26 @@ func (c *Controller) buildVlessUser(userInfo *[]api.UserInfo) (users []*protocol
 			Level:   0,
 			Email:   c.buildUserTag(&user),
 			Account: serial.ToTypedMessage(vlessAccount),
+		}
+	}
+	return users
+}
+
+// buildHysteriaUser builds the xray-core protocol.User list for a Hysteria 2
+// inbound. Auth is the V2/Xboard user UUID (matching the sing-box path's
+// password-or-uuid fallback). Only Hysteria 2 is supported — xray-core
+// dropped Hysteria 1.
+func (c *Controller) buildHysteriaUser(userInfo *[]api.UserInfo) (users []*protocol.User) {
+	users = make([]*protocol.User, len(*userInfo))
+	for i, user := range *userInfo {
+		auth := user.Passwd
+		if auth == "" {
+			auth = user.UUID
+		}
+		users[i] = &protocol.User{
+			Level:   0,
+			Email:   c.buildUserTag(&user),
+			Account: serial.ToTypedMessage(&account.Account{Auth: auth}),
 		}
 	}
 	return users

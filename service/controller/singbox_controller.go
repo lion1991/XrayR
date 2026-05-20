@@ -16,6 +16,7 @@ import (
 	sbservice "github.com/sagernet/sing-box/adapter/service"
 	sbc "github.com/sagernet/sing-box/constant"
 	sbdns "github.com/sagernet/sing-box/dns"
+	sblocaldns "github.com/sagernet/sing-box/dns/transport/local"
 	sboption "github.com/sagernet/sing-box/option"
 	sbanytls "github.com/sagernet/sing-box/protocol/anytls"
 	sbhysteria "github.com/sagernet/sing-box/protocol/hysteria"
@@ -291,12 +292,18 @@ func (c *SingBoxController) startSingBox() error {
 	}
 
 	ctx := context.Background()
+	// sing-box's box.New unconditionally configures a default DNS fallback
+	// of type "local"; the registry must contain that transport or startup
+	// panics with "transport type not found: local". The local transport
+	// only registers on demand, so we wire it explicitly here.
+	dnsTransportReg := sbdns.NewTransportRegistry()
+	sblocaldns.RegisterTransport(dnsTransportReg)
 	ctx = sb.Context(
 		ctx,
 		inReg,
 		sboutbound.NewRegistry(),
 		sbendpoint.NewRegistry(),
-		sbdns.NewTransportRegistry(),
+		dnsTransportReg,
 		sbservice.NewRegistry(),
 	)
 

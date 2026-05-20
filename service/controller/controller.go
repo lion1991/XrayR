@@ -419,6 +419,8 @@ func (c *Controller) addNewUser(userInfo *[]api.UserInfo, nodeInfo *api.NodeInfo
 		users = c.buildSSUser(userInfo, nodeInfo.CypherMethod)
 	case "Shadowsocks-Plugin":
 		users = c.buildSSPluginUser(userInfo)
+	case "Hysteria":
+		users = c.buildHysteriaUser(userInfo)
 	default:
 		return fmt.Errorf("unsupported node type: %s", nodeInfo.NodeType)
 	}

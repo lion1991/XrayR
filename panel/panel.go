@@ -214,7 +214,13 @@ func (p *Panel) Start() {
 			}
 		}
 		nodeType := apiClient.Describe().NodeType
-		if strings.EqualFold(nodeType, "AnyTLS") || strings.EqualFold(nodeType, "Hysteria") {
+		// Hysteria used to live on the sing-box controller, but xray-core
+		// v1.260327 added a native Hysteria 2 inbound + QUIC transport. We
+		// route it through the standard controller now so it benefits from
+		// the same dispatcher path (rate limiter + device tracking) as
+		// Trojan/VMess/etc. AnyTLS has no xray-core equivalent yet, so it
+		// stays on sing-box.
+		if strings.EqualFold(nodeType, "AnyTLS") {
 			controllerService = controller.NewSingBoxController(apiClient, controllerConfig, nodeConfig.PanelType)
 		} else {
 			controllerService = controller.New(server, apiClient, controllerConfig, nodeConfig.PanelType)
