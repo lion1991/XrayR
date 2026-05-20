@@ -308,9 +308,28 @@ func (c *APIClient) ReportNodeStatus(nodeStatus *api.NodeStatus) (err error) {
 	return nil
 }
 
-// ReportNodeOnlineUsers implements the API interface
+// ReportNodeOnlineUsers reports per-user device IPs to the V2/UniProxy
+// panel. The upstream stub was a no-op, which meant v2_user.online_count
+// stayed at 0 forever — the panel "devices" column read zero and the
+// cross-node device_limit feature didn't work. Wire format mirrors PHP's
+// UpdateAliveDataJob: `{<uid>: [<ip>, <ip>, ...], ...}`.
 func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) error {
-	return nil
+	if onlineUserList == nil || len(*onlineUserList) == 0 {
+		return nil
+	}
+	path := "/api/v1/server/UniProxy/alive"
+
+	// XrayR's controller emits one OnlineUser per (user, concurrent IP) pair,
+	// so the same UID can appear multiple times. Group IPs back into a list
+	// per UID before sending.
+	data := make(map[int][]string)
+	for _, u := range *onlineUserList {
+		data[u.UID] = append(data[u.UID], u.IP)
+	}
+
+	res, err := c.client.R().SetBody(data).ForceContentType("application/json").Post(path)
+	_, err = c.parseResponse(res, path, err)
+	return err
 }
 
 // ReportIllegal implements the API interface
