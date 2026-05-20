@@ -263,6 +263,14 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 			RejectUnknownSNI: config.CertConfig.RejectUnknownSni,
 		}
 		tlsSettings.Certs = append(tlsSettings.Certs, &conf.TLSCertConfig{CertFile: certFile, KeyFile: keyFile, OcspStapling: 3600})
+		// Hysteria 2 mandates ALPN=h3 (RFC 9114). xray-core's TLS layer
+		// doesn't auto-populate it, so clients hit "no application protocol"
+		// during the QUIC handshake. Set it explicitly here for Hysteria
+		// nodes only — adding h3 to other protocols would mis-advertise.
+		if nodeInfo.NodeType == "Hysteria" {
+			alpn := conf.StringList([]string{"h3"})
+			tlsSettings.ALPN = &alpn
+		}
 		streamSetting.TLSSettings = tlsSettings
 	}
 

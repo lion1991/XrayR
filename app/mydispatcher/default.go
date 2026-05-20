@@ -35,7 +35,11 @@ var errSniffingTimeout = newError("timeout on sniffing")
 
 type cachedReader struct {
 	sync.Mutex
-	reader *pipe.Reader
+	// Field changed from *pipe.Reader to buf.TimeoutReader to match
+	// upstream — Hysteria 2 (QUIC streams) wrap the link with a
+	// *buf.SingleReader, not the pipe used by TCP, and the old concrete
+	// type assertion panicked at runtime.
+	reader buf.TimeoutReader
 	cache  buf.MultiBuffer
 }
 
@@ -89,7 +93,7 @@ func (r *cachedReader) Interrupt() {
 		r.cache = buf.ReleaseMulti(r.cache)
 	}
 	r.Unlock()
-	r.reader.Interrupt()
+	common.Interrupt(r.reader)
 }
 
 // DefaultDispatcher is a custom implementation that embeds the official dispatcher
@@ -283,10 +287,18 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	if !sniffingRequest.Enabled {
 		go d.routedDispatch(ctx, outbound, destination)
 	} else {
+		// Sniffing needs a reader that supports ReadMultiBufferTimeout
+		// (the TimeoutReader interface). Hysteria 2's QUIC stream gives us
+		// a *buf.SingleReader which doesn't satisfy that — for those we
+		// skip sniffing rather than panic. The old code blindly asserted
+		// *pipe.Reader and crashed every Hysteria request.
+		tReader, ok := outbound.Reader.(buf.TimeoutReader)
+		if !ok {
+			go d.routedDispatch(ctx, outbound, destination)
+			return inbound, nil
+		}
 		go func() {
-			cReader := &cachedReader{
-				reader: outbound.Reader.(*pipe.Reader),
-			}
+			cReader := &cachedReader{reader: tReader}
 			outbound.Reader = cReader
 			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 			if err == nil {
@@ -330,10 +342,18 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	if !sniffingRequest.Enabled {
 		go d.routedDispatch(ctx, outbound, destination)
 	} else {
+		// Sniffing needs a reader that supports ReadMultiBufferTimeout
+		// (the TimeoutReader interface). Hysteria 2's QUIC stream gives us
+		// a *buf.SingleReader which doesn't satisfy that — for those we
+		// skip sniffing rather than panic. The old code blindly asserted
+		// *pipe.Reader and crashed every Hysteria request.
+		tReader, ok := outbound.Reader.(buf.TimeoutReader)
+		if !ok {
+			go d.routedDispatch(ctx, outbound, destination)
+			return nil
+		}
 		go func() {
-			cReader := &cachedReader{
-				reader: outbound.Reader.(*pipe.Reader),
-			}
+			cReader := &cachedReader{reader: tReader}
 			outbound.Reader = cReader
 			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 			if err == nil {
