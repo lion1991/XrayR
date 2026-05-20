@@ -167,10 +167,16 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 
 	switch networkType {
 	case "hysteria":
-		// Hysteria 2 transport (QUIC). Version is the only required field at
-		// build time; QUIC-level params would go under quicParams (we don't
-		// expose them yet).
+		// Hysteria 2 transport (QUIC). The protocol itself just needs version;
+		// obfs (salamander) and brutal-congestion bandwidth go under the
+		// shared finalmask transport, not into HysteriaConfig itself. This
+		// is xray-core's design: finalmask is a generic UDP obfuscation /
+		// congestion layer reusable across QUIC-based transports.
 		streamSetting.HysteriaSettings = &conf.HysteriaConfig{Version: 2}
+		finalMask := buildHysteriaFinalMask(nodeInfo)
+		if finalMask != nil {
+			streamSetting.FinalMask = finalMask
+		}
 	case "tcp":
 		tcpSetting := &conf.TCPConfig{
 			AcceptProxyProtocol: config.EnableProxyProtocol,
@@ -302,6 +308,48 @@ func getCertFile(certConfig *mylego.CertConfig) (certFile string, keyFile string
 	default:
 		return "", "", fmt.Errorf("unsupported certmode: %s", certConfig.CertMode)
 	}
+}
+
+// buildHysteriaFinalMask translates the V2/Xboard Hysteria protocol_settings
+// (obfs + bandwidth) into xray-core's finalmask schema. Returns nil if there's
+// nothing to configure (no obfs and no bandwidth caps), letting the inbound
+// run with vanilla QUIC defaults.
+//
+//	obfs.type/password -> finalmask.udp = [{type, settings:{password}}]
+//	bandwidth.up/down  -> finalmask.quicParams.{brutalUp, brutalDown, congestion=brutal}
+func buildHysteriaFinalMask(nodeInfo *api.NodeInfo) *conf.FinalMask {
+	hasObfs := nodeInfo.HysteriaObfs != ""
+	hasBW := nodeInfo.HysteriaUpMbps > 0 || nodeInfo.HysteriaDownMbps > 0
+	if !hasObfs && !hasBW {
+		return nil
+	}
+
+	fm := &conf.FinalMask{}
+
+	if hasObfs {
+		// salamander.Config has only a Password field; build the inner JSON
+		// inline so we don't have to import the proto package here.
+		settings := json.RawMessage(
+			fmt.Sprintf(`{"password":%q}`, nodeInfo.HysteriaObfsPassword),
+		)
+		fm.Udp = []conf.Mask{{
+			Type:     nodeInfo.HysteriaObfs,
+			Settings: &settings,
+		}}
+	}
+
+	if hasBW {
+		qp := &conf.QuicParamsConfig{Congestion: "brutal"}
+		if nodeInfo.HysteriaUpMbps > 0 {
+			qp.BrutalUp = conf.Bandwidth(fmt.Sprintf("%d mbps", nodeInfo.HysteriaUpMbps))
+		}
+		if nodeInfo.HysteriaDownMbps > 0 {
+			qp.BrutalDown = conf.Bandwidth(fmt.Sprintf("%d mbps", nodeInfo.HysteriaDownMbps))
+		}
+		fm.QuicParams = qp
+	}
+
+	return fm
 }
 
 func buildVlessFallbacks(fallbackConfigs []*FallBackConfig) ([]*conf.VLessInboundFallback, error) {
