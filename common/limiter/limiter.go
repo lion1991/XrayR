@@ -162,7 +162,18 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 }
 
 func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *rate.Limiter, SpeedLimit bool, Reject bool) {
-	if value, ok := l.InboundInfo.Load(tag); ok {
+	value, found := l.InboundInfo.Load(tag)
+	if !found {
+		// Surface the mismatch so we can see exactly which tag string the
+		// dispatcher hands in vs what AddInboundLimiter registered with.
+		fmt.Printf("[limiter] GetUserBucket: tag %q NOT in InboundInfo (registered tags follow)\n", tag)
+		l.InboundInfo.Range(func(k, _ any) bool {
+			fmt.Printf("[limiter]   registered: %q\n", k)
+			return true
+		})
+		return nil, false, false
+	}
+	if value, ok := value, found; ok {
 		var (
 			userLimit        uint64 = 0
 			deviceLimit, uid int

@@ -187,6 +187,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 
 	if user != nil && len(user.Email) > 0 {
 		// Speed Limit and Device Limit
+		errors.LogInfo(ctx, "mydispatcher: GetUserBucket tag=", sessionInbound.Tag, " email=", user.Email, " ip=", sessionInbound.Source.Address.IP().String())
 		bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
 		if reject {
 			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
