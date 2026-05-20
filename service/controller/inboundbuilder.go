@@ -119,10 +119,9 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 		}
 
 		proxySetting.NetworkList = &conf.NetworkList{"tcp", "udp"}
-		proxySetting.IVCheck = true
-		if config.DisableIVCheck {
-			proxySetting.IVCheck = false
-		}
+		// IVCheck was removed upstream in xray-core v1.260327 (legacy
+		// non-AEAD Shadowsocks is being deprecated in favor of VLESS
+		// Encryption). config.DisableIVCheck is now a no-op.
 
 	case "dokodemo-door":
 		protocol = "dokodemo-door"

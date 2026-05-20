@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- Stage 1: build the Go binary --------------------------------------------
-ARG GO_IMAGE=golang:1.25.5-alpine
+ARG GO_IMAGE=golang:1.26-alpine
 ARG RUNTIME_IMAGE=alpine:latest
 ARG GOPROXY=
 ARG GOSUMDB=
