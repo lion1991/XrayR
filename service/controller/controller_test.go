@@ -19,6 +19,18 @@ import (
 )
 
 func TestController(t *testing.T) {
+	// This is an upstream-inherited manual harness, not a unit test:
+	// it talks to a real SSpanel at 127.0.0.1:667 and ends with a
+	// blocking <-osSignals (so `go test` would hang on Ctrl+C). It
+	// also panics under our fork because we registered mydispatcher
+	// as routing.DispatcherType() — controller.go:72 then asserts the
+	// feature to *mydispatcher.DefaultDispatcher, but this test boots
+	// a core without registering mydispatcher.Config{}, so it gets
+	// the upstream default dispatcher back and the assertion blows
+	// up. Skipping rather than deleting keeps the code as a reference
+	// for anyone who wants to drive the controller by hand.
+	t.Skip("manual harness — requires a real SSpanel at 127.0.0.1:667 and ends in a blocking signal wait")
+
 	serverConfig := &conf.Config{
 		Stats:     &conf.StatsConfig{},
 		LogConfig: &conf.LogConfig{LogLevel: "debug"},
