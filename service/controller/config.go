@@ -42,13 +42,22 @@ type FallBackConfig struct {
 }
 
 type REALITYConfig struct {
-	Show             bool     `mapstructure:"Show"`
-	Dest             string   `mapstructure:"Dest"`
-	ProxyProtocolVer uint64   `mapstructure:"ProxyProtocolVer"`
-	ServerNames      []string `mapstructure:"ServerNames"`
-	PrivateKey       string   `mapstructure:"PrivateKey"`
-	MinClientVer     string   `mapstructure:"MinClientVer"`
-	MaxClientVer     string   `mapstructure:"MaxClientVer"`
-	MaxTimeDiff      uint64   `mapstructure:"MaxTimeDiff"`
-	ShortIds         []string `mapstructure:"ShortIds"`
+	Show                  bool                `mapstructure:"Show"`
+	Dest                  string              `mapstructure:"Dest"`
+	ProxyProtocolVer      uint64              `mapstructure:"ProxyProtocolVer"`
+	ServerNames           []string            `mapstructure:"ServerNames"`
+	PrivateKey            string              `mapstructure:"PrivateKey"`
+	MinClientVer          string              `mapstructure:"MinClientVer"`
+	MaxClientVer          string              `mapstructure:"MaxClientVer"`
+	MaxTimeDiff           uint64              `mapstructure:"MaxTimeDiff"`
+	ShortIds              []string            `mapstructure:"ShortIds"`
+	Mldsa65Seed           string              `mapstructure:"Mldsa65Seed"`
+	LimitFallbackUpload   LimitFallbackConfig `mapstructure:"LimitFallbackUpload"`
+	LimitFallbackDownload LimitFallbackConfig `mapstructure:"LimitFallbackDownload"`
+}
+
+type LimitFallbackConfig struct {
+	AfterBytes       uint64 `mapstructure:"AfterBytes"`
+	BytesPerSec      uint64 `mapstructure:"BytesPerSec"`
+	BurstBytesPerSec uint64 `mapstructure:"BurstBytesPerSec"`
 }

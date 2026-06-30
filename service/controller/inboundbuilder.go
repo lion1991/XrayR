@@ -225,7 +225,10 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 
 			r := nodeInfo.REALITYConfig
 			streamSetting.REALITYSettings = &conf.REALITYConfig{
-				Show:         config.REALITYConfigs.Show,
+				// Source Show from the panel config (r), not config.REALITYConfigs:
+				// in panel-driven mode config.REALITYConfigs may be nil, and the
+				// panel now carries Show itself.
+				Show:         r.Show,
 				Dest:         []byte(`"` + r.Dest + `"`),
 				Xver:         r.ProxyProtocolVer,
 				ServerNames:  r.ServerNames,
@@ -234,6 +237,17 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 				MaxClientVer: r.MaxClientVer,
 				MaxTimeDiff:  r.MaxTimeDiff,
 				ShortIds:     r.ShortIds,
+				Mldsa65Seed:  r.Mldsa65Seed,
+				LimitFallbackUpload: conf.LimitFallback{
+					AfterBytes:       r.LimitFallbackUpload.AfterBytes,
+					BytesPerSec:      r.LimitFallbackUpload.BytesPerSec,
+					BurstBytesPerSec: r.LimitFallbackUpload.BurstBytesPerSec,
+				},
+				LimitFallbackDownload: conf.LimitFallback{
+					AfterBytes:       r.LimitFallbackDownload.AfterBytes,
+					BytesPerSec:      r.LimitFallbackDownload.BytesPerSec,
+					BurstBytesPerSec: r.LimitFallbackDownload.BurstBytesPerSec,
+				},
 			}
 		}
 	} else if config.EnableREALITY && config.REALITYConfigs != nil {
@@ -250,6 +264,17 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 			MaxClientVer: config.REALITYConfigs.MaxClientVer,
 			MaxTimeDiff:  config.REALITYConfigs.MaxTimeDiff,
 			ShortIds:     config.REALITYConfigs.ShortIds,
+			Mldsa65Seed:  config.REALITYConfigs.Mldsa65Seed,
+			LimitFallbackUpload: conf.LimitFallback{
+				AfterBytes:       config.REALITYConfigs.LimitFallbackUpload.AfterBytes,
+				BytesPerSec:      config.REALITYConfigs.LimitFallbackUpload.BytesPerSec,
+				BurstBytesPerSec: config.REALITYConfigs.LimitFallbackUpload.BurstBytesPerSec,
+			},
+			LimitFallbackDownload: conf.LimitFallback{
+				AfterBytes:       config.REALITYConfigs.LimitFallbackDownload.AfterBytes,
+				BytesPerSec:      config.REALITYConfigs.LimitFallbackDownload.BytesPerSec,
+				BurstBytesPerSec: config.REALITYConfigs.LimitFallbackDownload.BurstBytesPerSec,
+			},
 		}
 	}
 

@@ -58,12 +58,32 @@ type v2ray struct {
 	VlessTlsSettings struct {
 		ServerPort string `json:"server_port"`
 		Dest       string `json:"dest"`
-		xVer       uint64 `json:"xver"`
-		Sni        string `json:"server_name"`
-		PrivateKey string `json:"private_key"`
-		ShortId    string `json:"short_id"`
+		// Xver MUST stay exported: encoding/json silently skips unexported
+		// fields, so the old `xVer` lowercase name made the panel's xver
+		// always decode to 0 (latent bug). Keep it capitalized.
+		Xver                  uint64         `json:"xver"`
+		Sni                   string         `json:"server_name"`  // legacy single SNI
+		ServerNames           []string       `json:"server_names"` // plural wins when non-empty
+		PrivateKey            string         `json:"private_key"`
+		ShortId               string         `json:"short_id"`  // legacy single shortId
+		ShortIds              []string       `json:"short_ids"` // plural wins when non-empty
+		MinClientVer          string         `json:"min_client_ver"`
+		MaxClientVer          string         `json:"max_client_ver"`
+		MaxTimeDiff           uint64         `json:"max_time_diff"`
+		Show                  bool           `json:"show"`
+		Mldsa65Seed           string         `json:"mldsa65_seed"`
+		LimitFallbackUpload   *limitFallback `json:"limit_fallback_upload"`
+		LimitFallbackDownload *limitFallback `json:"limit_fallback_download"`
 	} `json:"tls_settings"`
 	Tls int `json:"tls"`
+}
+
+// limitFallback mirrors xray-core's reality LimitFallback so the panel can
+// drive per-connection fallback rate limits. All fields optional.
+type limitFallback struct {
+	AfterBytes       uint64 `json:"after_bytes"`
+	BytesPerSec      uint64 `json:"bytes_per_sec"`
+	BurstBytesPerSec uint64 `json:"burst_bytes_per_sec"`
 }
 
 type trojan struct {

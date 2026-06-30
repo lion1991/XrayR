@@ -130,12 +130,23 @@ type DetectResult struct {
 }
 
 type REALITYConfig struct {
-	Dest             string
-	ProxyProtocolVer uint64
-	ServerNames      []string
-	PrivateKey       string
-	MinClientVer     string
-	MaxClientVer     string
-	MaxTimeDiff      uint64
-	ShortIds         []string
+	Dest                  string
+	ProxyProtocolVer      uint64
+	ServerNames           []string
+	PrivateKey            string
+	MinClientVer          string
+	MaxClientVer          string
+	MaxTimeDiff           uint64
+	ShortIds              []string
+	Show                  bool
+	Mldsa65Seed           string
+	LimitFallbackUpload   LimitFallback
+	LimitFallbackDownload LimitFallback
+}
+
+// LimitFallback mirrors xray-core's reality.LimitFallback (value type).
+type LimitFallback struct {
+	AfterBytes       uint64
+	BytesPerSec      uint64
+	BurstBytesPerSec uint64
 }

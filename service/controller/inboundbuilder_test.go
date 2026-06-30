@@ -66,6 +66,37 @@ func TestBuildTrojan(t *testing.T) {
 	}
 }
 
+func TestBuildVlessRealityInbound(t *testing.T) {
+	nodeInfo := &api.NodeInfo{
+		NodeType:          "V2ray",
+		NodeID:            1,
+		Port:              443,
+		TransportProtocol: "tcp",
+		Host:              "node.example.com",
+		EnableVless:       true,
+		VlessFlow:         "xtls-rprx-vision",
+		EnableTLS:         true,
+		EnableREALITY:     true,
+		REALITYConfig: &api.REALITYConfig{
+			Dest:        "a.example.com:443",
+			ServerNames: []string{"a.example.com", "b.example.com"},
+			// 43-char base64.RawURLEncoding of 32 zero bytes — passes the
+			// length check in xray-core's REALITYConfig.Build().
+			PrivateKey:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+			ShortIds:         []string{"aa", "bb"},
+			ProxyProtocolVer: 0,
+			Show:             true,
+		},
+	}
+	config := &Config{
+		DisableLocalREALITYConfig: true,
+		CertConfig:                &mylego.CertConfig{CertMode: "none"},
+	}
+	if _, err := InboundBuilder(config, nodeInfo, "test_tag"); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestBuildSS(t *testing.T) {
 	nodeInfo := &api.NodeInfo{
 		NodeType:          "Shadowsocks",

@@ -372,12 +372,12 @@ func (c *APIClient) parseAnyTLSNodeResponse(s *serverConfig) (*api.NodeInfo, err
 
 func (c *APIClient) parseHysteriaNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
 	return &api.NodeInfo{
-		NodeType:             c.NodeType,
-		NodeID:               c.NodeID,
-		Port:                 uint32(s.ServerPort),
-		TransportProtocol:    "udp",
-		EnableTLS:            true,
-		HysteriaVersion:      s.Version,
+		NodeType:          c.NodeType,
+		NodeID:            c.NodeID,
+		Port:              uint32(s.ServerPort),
+		TransportProtocol: "udp",
+		EnableTLS:         true,
+		HysteriaVersion:   s.Version,
 		// Obfs comes from serverConfig.Obfs (top-level field), not the
 		// embedded hysteria.HysteriaObfs which is shadowed and unfilled
 		// due to the json tag conflict with shadowsocks.Obfs.
@@ -420,6 +420,19 @@ func (c *APIClient) parseSSNodeResponse(s *serverConfig) (*api.NodeInfo, error) 
 	}, nil
 }
 
+// toAPILimitFallback converts the optional panel limit_fallback_* block into
+// the value type the inbound builder hands to xray-core. nil → zero value.
+func toAPILimitFallback(lf *limitFallback) api.LimitFallback {
+	if lf == nil {
+		return api.LimitFallback{}
+	}
+	return api.LimitFallback{
+		AfterBytes:       lf.AfterBytes,
+		BytesPerSec:      lf.BytesPerSec,
+		BurstBytesPerSec: lf.BurstBytesPerSec,
+	}
+}
+
 // parseV2rayNodeResponse parse the response for the given nodeInfo format
 func (c *APIClient) parseV2rayNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
 	var (
@@ -431,23 +444,37 @@ func (c *APIClient) parseV2rayNodeResponse(s *serverConfig) (*api.NodeInfo, erro
 		xVer          uint64
 	)
 
+	// Plural arrays win when present; otherwise wrap the legacy singular so
+	// nodes provisioned before the multi-value panel keep working unchanged.
+	serverNames := s.VlessTlsSettings.ServerNames
+	if len(serverNames) == 0 {
+		serverNames = []string{s.VlessTlsSettings.Sni}
+	}
+	shortIds := s.VlessTlsSettings.ShortIds
+	if len(shortIds) == 0 {
+		shortIds = []string{s.VlessTlsSettings.ShortId}
+	}
+
 	if s.VlessTlsSettings.Dest != "" {
 		dest = s.VlessTlsSettings.Dest
 	} else {
-		dest = s.VlessTlsSettings.Sni
+		dest = serverNames[0]
 	}
-	if s.VlessTlsSettings.xVer != 0 {
-		xVer = s.VlessTlsSettings.xVer
-	} else {
-		xVer = 0
-	}
+	xVer = s.VlessTlsSettings.Xver
 
 	realityConfig := api.REALITYConfig{
-		Dest:             dest + ":" + s.VlessTlsSettings.ServerPort,
-		ProxyProtocolVer: xVer,
-		ServerNames:      []string{s.VlessTlsSettings.Sni},
-		PrivateKey:       s.VlessTlsSettings.PrivateKey,
-		ShortIds:         []string{s.VlessTlsSettings.ShortId},
+		Dest:                  dest + ":" + s.VlessTlsSettings.ServerPort,
+		ProxyProtocolVer:      xVer,
+		ServerNames:           serverNames,
+		PrivateKey:            s.VlessTlsSettings.PrivateKey,
+		ShortIds:              shortIds,
+		MinClientVer:          s.VlessTlsSettings.MinClientVer,
+		MaxClientVer:          s.VlessTlsSettings.MaxClientVer,
+		MaxTimeDiff:           s.VlessTlsSettings.MaxTimeDiff,
+		Show:                  s.VlessTlsSettings.Show,
+		Mldsa65Seed:           s.VlessTlsSettings.Mldsa65Seed,
+		LimitFallbackUpload:   toAPILimitFallback(s.VlessTlsSettings.LimitFallbackUpload),
+		LimitFallbackDownload: toAPILimitFallback(s.VlessTlsSettings.LimitFallbackDownload),
 	}
 
 	if c.EnableVless {
