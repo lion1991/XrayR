@@ -232,10 +232,16 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 
 func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResult, request session.SniffingRequest, destination net.Destination) bool {
 	domain := result.Domain()
-	for _, d := range request.ExcludeForDomain {
-		if strings.ToLower(domain) == d {
-			return false
-		}
+	if domain == "" {
+		return false
+	}
+	// Upstream changed SniffingRequest.ExcludeForDomain []string -> geodata.DomainMatcher
+	// and added ExcludeForIP; mirror app/dispatcher's shouldOverride.
+	if request.ExcludeForDomain != nil && request.ExcludeForDomain.MatchAny(strings.ToLower(domain)) {
+		return false
+	}
+	if request.ExcludeForIP != nil && destination.Address.Family().IsIP() && request.ExcludeForIP.Match(destination.Address.IP()) {
+		return false
 	}
 	protocolString := result.Protocol()
 	if resComp, ok := result.(SnifferResultComposite); ok {
