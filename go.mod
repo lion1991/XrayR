@@ -5,6 +5,7 @@ go 1.26.3
 require (
 	dario.cat/mergo v1.0.0
 	github.com/bitly/go-simplejson v0.5.1
+	github.com/cloudflare/circl v1.6.3
 	github.com/deckarep/golang-set v1.8.0
 	github.com/eko/gocache/lib/v4 v4.1.6
 	github.com/eko/gocache/store/go_cache/v4 v4.2.2
@@ -92,7 +93,6 @@ require (
 	github.com/chenzhuoyu/iasm v0.9.1 // indirect
 	github.com/civo/civogo v0.3.63 // indirect
 	github.com/clbanning/mxj/v2 v2.7.0 // indirect
-	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/cloudflare/cloudflare-go v0.90.0 // indirect
 	github.com/cpu/goacmedns v0.1.1 // indirect
 	github.com/database64128/netx-go v0.1.1 // indirect
