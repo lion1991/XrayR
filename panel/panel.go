@@ -182,10 +182,7 @@ func (p *Panel) Start() {
 		}
 		var apiClient api.API
 		switch nodeConfig.PanelType {
-		// "Keeper" is the canonical panel type; "NewV2board" and "V2board" are
-		// backward-compat aliases kept for existing deployed config files. All
-		// three speak the same V2board-compatible UniProxy wire protocol.
-		case "Keeper", "NewV2board", "V2board":
+		case "Keeper":
 			apiClient = keeper.New(nodeConfig.ApiConfig)
 		default:
 			log.Panicf("Unsupport panel type: %s", nodeConfig.PanelType)

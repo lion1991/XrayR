@@ -1,8 +1,7 @@
 # ============================================================================
 # XrayR config for a keeper (Xboard/V2board-compatible) panel.
 #
-# PanelType is "Keeper" — the client that speaks keeper's UniProxy API. The
-# aliases "NewV2board" and "V2board" are still accepted for backward compat.
+# PanelType is "Keeper" — the client that speaks keeper's UniProxy API.
 # One entry under Nodes: per node; below is one of every protocol
 # keeper + this XrayR fork support: Shadowsocks, VMess, VLESS (+REALITY), Trojan,
 # Hysteria2, AnyTLS.

@@ -187,7 +187,7 @@ func (c *Controller) buildUserTag(user *api.UserInfo) string {
 func (c *Controller) checkShadowsocksPassword(password string, method string) (string, error) {
 	// Keeper speaks the V2board-compatible UniProxy protocol, so it needs the
 	// same shadowsocks-2022 key derivation (truncate + base64) as V2board.
-	if strings.Contains(c.panelType, "V2board") || strings.EqualFold(c.panelType, "Keeper") {
+	if strings.EqualFold(c.panelType, "Keeper") {
 		var userKey string
 		if len(password) < 16 {
 			return "", newError("shadowsocks2022 key's length must be greater than 16").AtWarning()
