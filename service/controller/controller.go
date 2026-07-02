@@ -36,6 +36,7 @@ type Controller struct {
 	Tag          string
 	userList     *[]api.UserInfo
 	tasks        []periodicTask
+	jitter       jitterHolder
 	limitedUsers map[api.UserInfo]LimitInfo
 	warnedUsers  map[api.UserInfo]int
 	panelType    string
@@ -80,6 +81,11 @@ func New(server *core.Instance, api api.API, config *Config, panelType string) *
 // Start implement the Start() function of the service interface
 func (c *Controller) Start() error {
 	c.clientInfo = c.apiClient.Describe()
+	// Default the poll interval so a node that omits UpdatePeriodic doesn't spin
+	// a zero-interval task hammering the panel (mirrors the sing-box controller).
+	if c.config.UpdatePeriodic <= 0 {
+		c.config.UpdatePeriodic = 60
+	}
 	// First fetch Node Info
 	newNodeInfo, err := c.apiClient.GetNodeInfo()
 	if err != nil {
@@ -136,24 +142,30 @@ func (c *Controller) Start() error {
 		c.warnedUsers = make(map[api.UserInfo]int)
 	}
 
-	// Add periodic tasks
+	// Add periodic tasks. A random delay is folded into each poll/report so the
+	// node<->panel cadence isn't a fixed-period beacon (see withJitter). The
+	// jitter is read live from c.jitter, refreshed each pull from the panel's
+	// base_config (node-local UpdatePeriodicJitter as fallback); 0 == stock
+	// fixed cadence.
+	c.jitter.set(effectiveJitter(c.apiClient, c.config.UpdatePeriodicJitter))
 	c.tasks = append(c.tasks,
 		periodicTask{
 			tag: "node monitor",
 			Periodic: &task.Periodic{
 				Interval: time.Duration(c.config.UpdatePeriodic) * time.Second,
-				Execute:  c.nodeInfoMonitor,
+				Execute:  withJitter(&c.jitter, c.nodeInfoMonitor),
 			}},
 		periodicTask{
 			tag: "user monitor",
 			Periodic: &task.Periodic{
 				Interval: time.Duration(c.config.UpdatePeriodic) * time.Second,
-				Execute:  c.userInfoMonitor,
+				Execute:  withJitter(&c.jitter, c.userInfoMonitor),
 			}},
 	)
 
-	// Check cert service in need
-	if c.nodeInfo.EnableTLS && c.config.EnableREALITY == false {
+	// Check cert service in need. A REALITY node (local flag or panel-marked)
+	// never needs a certificate, so skip the cert monitor for it.
+	if c.nodeInfo.EnableTLS && !c.isRealityNode() {
 		c.tasks = append(c.tasks, periodicTask{
 			tag: "cert monitor",
 			Periodic: &task.Periodic{
@@ -308,6 +320,12 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		}
 		c.logger.Printf("%d user deleted, %d user added", len(deleted), len(added))
 	}
+
+	// Refresh heartbeat jitter from the panel each pull (base_config
+	// interval_jitter), node-local as fallback. Deliberately outside the
+	// NodeInfo DeepEqual above so a jitter change never rebuilds the inbound.
+	c.jitter.set(effectiveJitter(c.apiClient, c.config.UpdatePeriodicJitter))
+
 	c.userList = newUserInfo
 	return nil
 }
@@ -628,8 +646,16 @@ func (c *Controller) buildNodeTag() string {
 // }
 
 // Check Cert
+// isRealityNode reports whether this node speaks REALITY — either because the
+// local config enables it or because the panel marked the node as REALITY
+// (tls==2). Used to skip TLS certificate handling, which REALITY never needs,
+// so a panel-driven REALITY node can omit the local EnableREALITY flag.
+func (c *Controller) isRealityNode() bool {
+	return c.config.EnableREALITY || c.nodeInfo.EnableREALITY
+}
+
 func (c *Controller) certMonitor() error {
-	if c.nodeInfo.EnableTLS && c.config.EnableREALITY == false {
+	if c.nodeInfo.EnableTLS && !c.isRealityNode() {
 		switch c.config.CertConfig.CertMode {
 		case "dns", "http", "tls":
 			lego, err := mylego.New(c.config.CertConfig)

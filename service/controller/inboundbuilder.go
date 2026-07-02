@@ -218,7 +218,11 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 
 	// Build TLS and REALITY settings
 	var isREALITY bool
-	if config.DisableLocalREALITYConfig {
+	// Use panel-pushed REALITY when forced (DisableLocalREALITYConfig) or when
+	// the panel marks the node as REALITY and there's no local REALITYConfigs to
+	// honour — so a panel-driven node can omit both DisableLocalREALITYConfig and
+	// EnableREALITY. An explicit local REALITYConfigs still wins otherwise.
+	if config.DisableLocalREALITYConfig || (nodeInfo.EnableREALITY && config.REALITYConfigs == nil) {
 		if nodeInfo.REALITYConfig != nil && nodeInfo.EnableREALITY {
 			isREALITY = true
 			streamSetting.Security = "reality"

@@ -22,8 +22,9 @@ type serverConfig struct {
 
 	ServerPort int `json:"server_port"`
 	BaseConfig struct {
-		PushInterval int `json:"push_interval"`
-		PullInterval int `json:"pull_interval"`
+		PushInterval   int `json:"push_interval"`
+		PullInterval   int `json:"pull_interval"`
+		IntervalJitter int `json:"interval_jitter"`
 	} `json:"base_config"`
 	Routes []route `json:"routes"`
 }

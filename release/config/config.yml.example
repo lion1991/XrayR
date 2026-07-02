@@ -20,8 +20,8 @@ Nodes:
       NodeID: 41
       NodeType: V2ray # Node type: V2ray, Vmess, Vless, Shadowsocks, Trojan, Shadowsocks-Plugin
       Timeout: 30 # Timeout for the api request
-      EnableVless: false # Enable Vless for V2ray Type
-      VlessFlow: "xtls-rprx-vision" # Only support vless
+      EnableVless: false # Legacy switch for V2ray-type nodes. NodeType: Vless now implies vless on its own, so you can drop this flag and just set NodeType: Vless.
+      VlessFlow: "xtls-rprx-vision" # Only support vless. Ignored — the flow is taken from the panel; safe to remove.
       SpeedLimit: 0 # Mbps, Local settings will replace remote settings, 0 means disable
       DeviceLimit: 0 # Local settings will replace remote settings, 0 means disable
       RuleListPath: # /etc/XrayR/rulelist Path to local rulelist file
@@ -29,7 +29,8 @@ Nodes:
     ControllerConfig:
       ListenIP: 0.0.0.0 # IP address you want to listen
       SendIP: 0.0.0.0 # IP address you want to send pacakage
-      UpdatePeriodic: 60 # Time to update the nodeinfo, how many sec.
+      UpdatePeriodic: 60 # Time to update the nodeinfo, how many sec. Optional — defaults to 60 if omitted or <=0.
+      UpdatePeriodicJitter: 0 # Add a random 0..N sec delay to each poll/report so the node<->panel heartbeat isn't a fixed-period beacon. 0 = off. Optional — the panel's server_interval_jitter overrides this, so a keeper node can leave it out.
       EnableDNS: false # Use custom DNS config, Please ensure that you set the dns.json well
       DNSType: AsIs # AsIs, UseIP, UseIPv4, UseIPv6, DNS strategy
       EnableProxyProtocol: false # Only works for WebSocket and TCP

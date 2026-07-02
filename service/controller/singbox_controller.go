@@ -37,6 +37,7 @@ type SingBoxController struct {
 	Tag       string
 	userList  *[]api.UserInfo
 	tasks     []periodicTask
+	jitter    jitterHolder
 	panelType string
 
 	startAt time.Time
@@ -90,18 +91,23 @@ func (c *SingBoxController) Start() error {
 		interval = 60 * time.Second
 	}
 
+	// Fold a random delay into each poll/report so the node<->panel cadence
+	// isn't a fixed-period beacon (see withJitter). sing-box nodes don't re-pull
+	// /config, so panel jitter is read once here at start (node-local as
+	// fallback); changing it in the panel takes effect on node restart.
+	c.jitter.set(effectiveJitter(c.apiClient, c.config.UpdatePeriodicJitter))
 	c.tasks = append(c.tasks, periodicTask{
 		tag: "heartbeat",
 		Periodic: &task.Periodic{
 			Interval: interval,
-			Execute:  c.heartbeatMonitor,
+			Execute:  withJitter(&c.jitter, c.heartbeatMonitor),
 		},
 	})
 	c.tasks = append(c.tasks, periodicTask{
 		tag: "traffic monitor",
 		Periodic: &task.Periodic{
 			Interval: interval,
-			Execute:  c.trafficMonitor,
+			Execute:  withJitter(&c.jitter, c.trafficMonitor),
 		},
 	})
 

@@ -71,13 +71,17 @@ func New(apiConfig *api.Config) *APIClient {
 	})
 	// Read local rule list
 	localRuleList := readLocalRuleList(apiConfig.RuleListPath)
+	// Treat NodeType "Vless" as a first-class protocol: it implies vless on its
+	// own, so a node no longer needs the legacy EnableVless flag. The old
+	// NodeType "V2ray" + EnableVless: true form still works for existing configs.
+	enableVless := apiConfig.EnableVless || strings.EqualFold(apiConfig.NodeType, "Vless")
 	apiClient := &APIClient{
 		client:        client,
 		NodeID:        apiConfig.NodeID,
 		Key:           apiConfig.Key,
 		APIHost:       apiConfig.APIHost,
 		NodeType:      apiConfig.NodeType,
-		EnableVless:   apiConfig.EnableVless,
+		EnableVless:   enableVless,
 		VlessFlow:     apiConfig.VlessFlow,
 		SpeedLimit:    apiConfig.SpeedLimit,
 		DeviceLimit:   apiConfig.DeviceLimit,
@@ -203,6 +207,18 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 	}
 
 	return nodeInfo, nil
+}
+
+// GetIntervalJitter returns the panel-provided base_config.interval_jitter in
+// seconds from the most recent /config pull (0 if the panel didn't send one).
+// It is surfaced separately from GetNodeInfo, reading the already-stashed
+// serverConfig, so a jitter change never enters the NodeInfo comparison that
+// would rebuild the inbound. Implements controller's jitterProvider.
+func (c *APIClient) GetIntervalJitter() int {
+	if v, ok := c.resp.Load().(*serverConfig); ok && v != nil {
+		return v.BaseConfig.IntervalJitter
+	}
+	return 0
 }
 
 // GetUserList will pull user form panel

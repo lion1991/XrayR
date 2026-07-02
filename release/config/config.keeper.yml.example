@@ -1,0 +1,175 @@
+# ============================================================================
+# XrayR config for a keeper (Xboard/V2board-compatible) panel.
+#
+# PanelType is always "NewV2board" — that's the client that speaks keeper's
+# UniProxy API. One entry under Nodes: per node; below is one of every protocol
+# keeper + this XrayR fork support: Shadowsocks, VMess, VLESS (+REALITY), Trojan,
+# Hysteria2, AnyTLS.
+#
+# Design: the panel drives the inbound shape (port, transport, TLS, SNI, cipher,
+# flow, REALITY keys, obfs, bandwidth, padding). The node only declares its
+# identity + (for TLS protocols) how to obtain a certificate.
+#
+# ControllerConfig is OPTIONAL: if omitted the node uses the built-in defaults
+# ListenIP/SendIP 0.0.0.0, UpdatePeriodic 60, DNSType AsIs (see
+# panel/defaultConfig.go); anything you set is merged over those. So a
+# no-certificate node needs nothing but ApiConfig.
+#
+# Cert rule of thumb: TLS-terminating protocols (Trojan / Hysteria / AnyTLS /
+# VMess+TLS / VLESS+TLS) MUST provide a CertConfig — certificates are obtained on
+# the node, the panel never sends them. Shadowsocks, plain VMess and
+# VLESS+REALITY need NO CertConfig, hence no ControllerConfig at all.
+# ============================================================================
+
+Log:
+  Level: warning # none, error, warning, info, debug
+  AccessPath: # /etc/XrayR/access.log
+  ErrorPath: # /etc/XrayR/error.log
+DnsConfigPath: # /etc/XrayR/dns.json
+RouteConfigPath: # /etc/XrayR/route.json
+InboundConfigPath: # /etc/XrayR/custom_inbound.json
+OutboundConfigPath: # /etc/XrayR/custom_outbound.json
+ConnectionConfig:
+  Handshake: 4
+  ConnIdle: 30
+  UplinkOnly: 2
+  DownlinkOnly: 4
+  BufferSize: 64
+
+Nodes:
+  # --- 1. Shadowsocks — no TLS, no certificate → ApiConfig only ------------
+  - PanelType: "NewV2board"
+    ApiConfig:
+      ApiHost: "https://your.domain"
+      ApiKey: "节点通讯密钥" # = panel Settings -> server_token
+      NodeID: 1
+      NodeType: Shadowsocks
+
+  # --- 2. VMess (plain, no TLS) → ApiConfig only --------------------------
+  # VMess = NodeType V2ray without EnableVless. For VMess+TLS add a CertConfig
+  # like the Trojan node below.
+  - PanelType: "NewV2board"
+    ApiConfig:
+      ApiHost: "https://your.domain"
+      ApiKey: "节点通讯密钥"
+      NodeID: 2
+      NodeType: V2ray
+
+  # --- 3. VLESS + REALITY — the minimal case → ApiConfig only -------------
+  # Everything REALITY (keys, SNI, shortIds, dest, flow) comes from the panel.
+  - PanelType: "NewV2board"
+    ApiConfig:
+      ApiHost: "https://your.domain"
+      ApiKey: "节点通讯密钥"
+      NodeID: 3
+      NodeType: Vless
+
+  # --- 4. VLESS + TLS (non-REALITY) — needs a certificate -----------------
+  - PanelType: "NewV2board"
+    ApiConfig:
+      ApiHost: "https://your.domain"
+      ApiKey: "节点通讯密钥"
+      NodeID: 4
+      NodeType: Vless
+    ControllerConfig:
+      CertConfig:
+        CertMode: http # none/file/http/tls/dns — http/tls need port 80/443 free for ACME
+        CertDomain: "node4.your.domain"
+        Email: you@example.com
+
+  # --- 5. Trojan — always TLS, needs a certificate ------------------------
+  - PanelType: "NewV2board"
+    ApiConfig:
+      ApiHost: "https://your.domain"
+      ApiKey: "节点通讯密钥"
+      NodeID: 5
+      NodeType: Trojan
+    ControllerConfig:
+      CertConfig:
+        CertMode: http
+        CertDomain: "node5.your.domain"
+        Email: you@example.com
+
+  # --- 6. Hysteria2 — UDP/QUIC, always TLS, needs a certificate -----------
+  # QUIC is UDP: make sure the node port is reachable over UDP. HTTP-01 ACME
+  # still uses TCP/80; if 80 is taken, use CertMode: dns instead (see AnyTLS).
+  - PanelType: "NewV2board"
+    ApiConfig:
+      ApiHost: "https://your.domain"
+      ApiKey: "节点通讯密钥"
+      NodeID: 6
+      NodeType: Hysteria
+    ControllerConfig:
+      CertConfig:
+        CertMode: http
+        CertDomain: "node6.your.domain"
+        Email: you@example.com
+
+  # --- 7. AnyTLS — runs on the sing-box controller, needs a certificate ---
+  # DNS-01 example (no open port needed): fill the provider + its DNS env.
+  - PanelType: "NewV2board"
+    ApiConfig:
+      ApiHost: "https://your.domain"
+      ApiKey: "节点通讯密钥"
+      NodeID: 7
+      NodeType: AnyTLS
+    ControllerConfig:
+      CertConfig:
+        CertMode: dns
+        CertDomain: "node7.your.domain"
+        Provider: cloudflare # full list: https://go-acme.github.io/lego/dns/
+        Email: you@example.com
+        DNSEnv:
+          CF_DNS_API_TOKEN: your_token
+
+# ============================================================================
+# Full ControllerConfig reference — every field you MAY set. ALL optional; the
+# value shown is the effective default when omitted. A keeper node normally sets
+# none of these beyond CertConfig (TLS protocols only).
+# ============================================================================
+#    ControllerConfig:
+#      ListenIP: 0.0.0.0          # inbound bind address (default 0.0.0.0 = all interfaces)
+#      SendIP: 0.0.0.0            # outbound source address (default: system default source)
+#      UpdatePeriodic: 60         # node<->panel poll/report interval (sec)
+#      UpdatePeriodicJitter: 0    # random 0..N sec added per poll to break the fixed heartbeat beacon;
+#                                 # the panel's server_interval_jitter overrides this, so usually leave it out
+#      EnableDNS: false           # use a custom dns.json (DnsConfigPath)
+#      DNSType: AsIs              # AsIs / UseIP / UseIPv4 / UseIPv6
+#      EnableProxyProtocol: false # PROXY protocol (WebSocket/TCP only)
+#      EnableFallback: false      # Trojan/VLESS fallback
+#      FallBackConfigs:
+#        - SNI:
+#          Alpn:
+#          Path:
+#          Dest: 80
+#          ProxyProtocolVer: 0
+#      AutoSpeedLimitConfig:      # XrayR-side auto speed limit; omit to disable
+#        Limit: 0
+#        WarnTimes: 0
+#        LimitSpeed: 0
+#        LimitDuration: 0
+#      GlobalDeviceLimitConfig:   # Redis-backed global device cap; omit to disable
+#        Enable: false
+#        RedisNetwork: tcp
+#        RedisAddr: 127.0.0.1:6379
+#        RedisPassword: PASSWORD
+#        RedisDB: 0
+#        Timeout: 5
+#        Expiry: 60
+#      # Local REALITY (only if you DON'T let the panel drive it):
+#      DisableLocalREALITYConfig: false
+#      EnableREALITY: false
+#      REALITYConfigs:
+#        Dest: www.example.com:443
+#        ServerNames: [www.example.com]
+#        PrivateKey: PRIVATE_KEY
+#        ShortIds: ["", 0123456789abcdef]
+#      CertConfig:
+#        CertMode: none           # none/file/http/tls/dns
+#        CertDomain: node.your.domain
+#        CertFile: /etc/XrayR/cert/node.cert   # CertMode: file
+#        KeyFile: /etc/XrayR/cert/node.key
+#        Provider: cloudflare     # CertMode: dns
+#        Email: you@example.com
+#        DNSEnv:
+#          CF_DNS_API_TOKEN: token

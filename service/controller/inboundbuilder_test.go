@@ -97,6 +97,37 @@ func TestBuildVlessRealityInbound(t *testing.T) {
 	}
 }
 
+// TestBuildVlessRealityPanelDriven verifies a fully panel-driven REALITY node:
+// the config carries NO DisableLocalREALITYConfig, NO EnableREALITY flag and NO
+// CertConfig. The builder must auto-select the panel's REALITY config (nodeInfo
+// marks the node REALITY) and must not dereference the nil CertConfig.
+func TestBuildVlessRealityPanelDriven(t *testing.T) {
+	nodeInfo := &api.NodeInfo{
+		NodeType:          "V2ray",
+		NodeID:            1,
+		Port:              443,
+		TransportProtocol: "tcp",
+		Host:              "node.example.com",
+		EnableVless:       true,
+		VlessFlow:         "xtls-rprx-vision",
+		EnableTLS:         true,
+		EnableREALITY:     true,
+		REALITYConfig: &api.REALITYConfig{
+			Dest:             "a.example.com:443",
+			ServerNames:      []string{"a.example.com"},
+			PrivateKey:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+			ShortIds:         []string{"aa"},
+			ProxyProtocolVer: 0,
+			Show:             false,
+		},
+	}
+	// Minimal config: no reality flags, no CertConfig.
+	config := &Config{}
+	if _, err := InboundBuilder(config, nodeInfo, "test_tag"); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestBuildSS(t *testing.T) {
 	nodeInfo := &api.NodeInfo{
 		NodeType:          "Shadowsocks",

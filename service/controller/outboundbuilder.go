@@ -16,8 +16,12 @@ func OutboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.
 	outboundDetourConfig.Protocol = "freedom"
 	outboundDetourConfig.Tag = tag
 
-	// SendThrough setting
-	outboundDetourConfig.SendThrough = &config.SendIP
+	// SendThrough setting — only pin the outbound source when one is configured.
+	// An empty SendIP must not be handed to xray-core as a blank send-through,
+	// so a node can omit SendIP (falls back to the system default source).
+	if config.SendIP != "" {
+		outboundDetourConfig.SendThrough = &config.SendIP
+	}
 
 	// Freedom Protocol setting
 	var domainStrategy = "Asis"
