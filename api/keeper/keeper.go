@@ -1,4 +1,5 @@
-package newV2board
+// Package keeper is the keeper panel integration (V2board-compatible UniProxy API).
+package keeper
 
 import (
 	"bufio"
@@ -331,7 +332,7 @@ func (c *APIClient) ReportNodeStatus(nodeStatus *api.NodeStatus) (err error) {
 // UpdateAliveDataJob: `{<uid>: [<ip>, <ip>, ...], ...}`.
 func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) error {
 	if onlineUserList == nil || len(*onlineUserList) == 0 {
-		log.Print("[newV2board] ReportNodeOnlineUsers: empty list, skipping")
+		log.Print("[keeper] ReportNodeOnlineUsers: empty list, skipping")
 		return nil
 	}
 	path := "/api/v1/server/UniProxy/alive"
@@ -344,11 +345,11 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
 		data[u.UID] = append(data[u.UID], u.IP)
 	}
 
-	log.Printf("[newV2board] ReportNodeOnlineUsers: POSTing %d users to %s", len(data), path)
+	log.Printf("[keeper] ReportNodeOnlineUsers: POSTing %d users to %s", len(data), path)
 	res, err := c.client.R().SetBody(data).ForceContentType("application/json").Post(path)
 	_, err = c.parseResponse(res, path, err)
 	if err != nil {
-		log.Printf("[newV2board] ReportNodeOnlineUsers failed: %v", err)
+		log.Printf("[keeper] ReportNodeOnlineUsers failed: %v", err)
 	}
 	return err
 }

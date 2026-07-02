@@ -1,4 +1,4 @@
-package newV2board
+package keeper
 
 import (
 	"encoding/json"

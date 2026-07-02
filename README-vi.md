@@ -56,12 +56,7 @@ Dự án này chỉ là học tập và phát triển và bảo trì cá nhân c
 
 | Panel                                                     | v2ray | trojan | shadowsocks             |
 |--------------------------------------------------------|-------|--------|-------------------------|
-| sspanel-uim                                            | √     | √      | √ (Nhiều người dùng cuối và v2ray-plugin) |
-| v2board                                                | √     | √      | √                       |
-| [PMPanel](https://github.com/ByteInternetHK/PMPanel)   | √     | √      | √                       |
-| [ProxyPanel](https://github.com/ProxyPanel/ProxyPanel) | √     | √      | √                       |
-| [WHMCS (V2RaySocks)](https://v2raysocks.doxtex.com/)   | √     | √      | √                       |
-| [BunPanel](https://github.com/pennyMorant/bunpanel-release)   | √     | √      | √                       |
+| keeper (V2board-compatible)                            | √     | √      | √                       |
 
 ## Cài đặt phần mềm
 

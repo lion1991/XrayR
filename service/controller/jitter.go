@@ -35,7 +35,7 @@ func withJitter(h *jitterHolder, fn func() error) func() error {
 }
 
 // jitterProvider is implemented by API clients that surface the panel's
-// base_config.interval_jitter (currently newV2board). Clients that don't are
+// base_config.interval_jitter (currently keeper). Clients that don't are
 // treated as "no panel jitter" and the node-local value is used.
 type jitterProvider interface {
 	GetIntervalJitter() int

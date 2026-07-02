@@ -54,12 +54,7 @@
 
 | قسمت فرانت                                                     | v2ray | trojan | shadowsocks             |
 |--------------------------------------------------------|-------|--------|-------------------------|
-| sspanel-uim                                            | √     | √      | √ (تک پورت چند کاربره و V2ray-Plugin) |
-| v2board                                                | √     | √      | √                       |
-| [PMPanel](https://github.com/ByteInternetHK/PMPanel)   | √     | √      | √                       |
-| [ProxyPanel](https://github.com/ProxyPanel/ProxyPanel) | √     | √      | √                       |
-| [WHMCS (V2RaySocks)](https://v2raysocks.doxtex.com/)   | √     | √      | √                       |
-| [BunPanel](https://github.com/pennyMorant/bunpanel-release)   | √     | √      | √                       |
+| keeper (V2board-compatible)                            | √     | √      | √                       |
 
 ## نصب نرم افزار
 

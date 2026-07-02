@@ -16,13 +16,7 @@ import (
 	"github.com/xtls/xray-core/infra/conf"
 
 	"github.com/XrayR-project/XrayR/api"
-	"github.com/XrayR-project/XrayR/api/bunpanel"
-	"github.com/XrayR-project/XrayR/api/gov2panel"
-	"github.com/XrayR-project/XrayR/api/newV2board"
-	"github.com/XrayR-project/XrayR/api/pmpanel"
-	"github.com/XrayR-project/XrayR/api/proxypanel"
-	"github.com/XrayR-project/XrayR/api/sspanel"
-	"github.com/XrayR-project/XrayR/api/v2raysocks"
+	"github.com/XrayR-project/XrayR/api/keeper"
 	"github.com/XrayR-project/XrayR/app/mydispatcher"
 	_ "github.com/XrayR-project/XrayR/cmd/distro/all"
 	"github.com/XrayR-project/XrayR/service"
@@ -188,20 +182,11 @@ func (p *Panel) Start() {
 		}
 		var apiClient api.API
 		switch nodeConfig.PanelType {
-		case "SSpanel":
-			apiClient = sspanel.New(nodeConfig.ApiConfig)
-		case "NewV2board", "V2board":
-			apiClient = newV2board.New(nodeConfig.ApiConfig)
-		case "PMpanel":
-			apiClient = pmpanel.New(nodeConfig.ApiConfig)
-		case "Proxypanel":
-			apiClient = proxypanel.New(nodeConfig.ApiConfig)
-		case "V2RaySocks":
-			apiClient = v2raysocks.New(nodeConfig.ApiConfig)
-		case "GoV2Panel":
-			apiClient = gov2panel.New(nodeConfig.ApiConfig)
-		case "BunPanel":
-			apiClient = bunpanel.New(nodeConfig.ApiConfig)
+		// "Keeper" is the canonical panel type; "NewV2board" and "V2board" are
+		// backward-compat aliases kept for existing deployed config files. All
+		// three speak the same V2board-compatible UniProxy wire protocol.
+		case "Keeper", "NewV2board", "V2board":
+			apiClient = keeper.New(nodeConfig.ApiConfig)
 		default:
 			log.Panicf("Unsupport panel type: %s", nodeConfig.PanelType)
 		}

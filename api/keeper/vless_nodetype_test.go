@@ -1,10 +1,10 @@
-package newV2board_test
+package keeper_test
 
 import (
 	"testing"
 
 	"github.com/XrayR-project/XrayR/api"
-	"github.com/XrayR-project/XrayR/api/newV2board"
+	"github.com/XrayR-project/XrayR/api/keeper"
 )
 
 // TestVlessNodeTypeImpliesEnableVless locks in that "Vless" is a first-class
@@ -25,7 +25,7 @@ func TestVlessNodeTypeImpliesEnableVless(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.nodeType, func(t *testing.T) {
-			c := newV2board.New(&api.Config{
+			c := keeper.New(&api.Config{
 				APIHost:     "http://127.0.0.1:0",
 				Key:         "k",
 				NodeID:      1,

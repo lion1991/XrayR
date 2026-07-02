@@ -1,8 +1,9 @@
 # ============================================================================
 # XrayR config for a keeper (Xboard/V2board-compatible) panel.
 #
-# PanelType is always "NewV2board" — that's the client that speaks keeper's
-# UniProxy API. One entry under Nodes: per node; below is one of every protocol
+# PanelType is "Keeper" — the client that speaks keeper's UniProxy API. The
+# aliases "NewV2board" and "V2board" are still accepted for backward compat.
+# One entry under Nodes: per node; below is one of every protocol
 # keeper + this XrayR fork support: Shadowsocks, VMess, VLESS (+REALITY), Trojan,
 # Hysteria2, AnyTLS.
 #
@@ -38,7 +39,7 @@ ConnectionConfig:
 
 Nodes:
   # --- 1. Shadowsocks — no TLS, no certificate → ApiConfig only ------------
-  - PanelType: "NewV2board"
+  - PanelType: "Keeper"
     ApiConfig:
       ApiHost: "https://your.domain"
       ApiKey: "节点通讯密钥" # = panel Settings -> server_token
@@ -48,7 +49,7 @@ Nodes:
   # --- 2. VMess (plain, no TLS) → ApiConfig only --------------------------
   # VMess = NodeType V2ray without EnableVless. For VMess+TLS add a CertConfig
   # like the Trojan node below.
-  - PanelType: "NewV2board"
+  - PanelType: "Keeper"
     ApiConfig:
       ApiHost: "https://your.domain"
       ApiKey: "节点通讯密钥"
@@ -57,7 +58,7 @@ Nodes:
 
   # --- 3. VLESS + REALITY — the minimal case → ApiConfig only -------------
   # Everything REALITY (keys, SNI, shortIds, dest, flow) comes from the panel.
-  - PanelType: "NewV2board"
+  - PanelType: "Keeper"
     ApiConfig:
       ApiHost: "https://your.domain"
       ApiKey: "节点通讯密钥"
@@ -65,7 +66,7 @@ Nodes:
       NodeType: Vless
 
   # --- 4. VLESS + TLS (non-REALITY) — needs a certificate -----------------
-  - PanelType: "NewV2board"
+  - PanelType: "Keeper"
     ApiConfig:
       ApiHost: "https://your.domain"
       ApiKey: "节点通讯密钥"
@@ -78,7 +79,7 @@ Nodes:
         Email: you@example.com
 
   # --- 5. Trojan — always TLS, needs a certificate ------------------------
-  - PanelType: "NewV2board"
+  - PanelType: "Keeper"
     ApiConfig:
       ApiHost: "https://your.domain"
       ApiKey: "节点通讯密钥"
@@ -93,7 +94,7 @@ Nodes:
   # --- 6. Hysteria2 — UDP/QUIC, always TLS, needs a certificate -----------
   # QUIC is UDP: make sure the node port is reachable over UDP. HTTP-01 ACME
   # still uses TCP/80; if 80 is taken, use CertMode: dns instead (see AnyTLS).
-  - PanelType: "NewV2board"
+  - PanelType: "Keeper"
     ApiConfig:
       ApiHost: "https://your.domain"
       ApiKey: "节点通讯密钥"
@@ -107,7 +108,7 @@ Nodes:
 
   # --- 7. AnyTLS — runs on the sing-box controller, needs a certificate ---
   # DNS-01 example (no open port needed): fill the provider + its DNS env.
-  - PanelType: "NewV2board"
+  - PanelType: "Keeper"
     ApiConfig:
       ApiHost: "https://your.domain"
       ApiKey: "节点通讯密钥"
