@@ -199,6 +199,8 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		nodeInfo, err = c.parseAnyTLSNodeResponse(server)
 	case "Hysteria":
 		nodeInfo, err = c.parseHysteriaNodeResponse(server)
+	case "Snell":
+		nodeInfo, err = c.parseSnellNodeResponse(server)
 	default:
 		return nil, fmt.Errorf("unsupported node type: %s", c.NodeType)
 	}
@@ -228,7 +230,7 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	path := "/api/v1/server/UniProxy/user"
 
 	switch c.NodeType {
-	case "V2ray", "Trojan", "Shadowsocks", "Vmess", "Vless", "AnyTLS", "Hysteria":
+	case "V2ray", "Trojan", "Shadowsocks", "Vmess", "Vless", "AnyTLS", "Hysteria", "Snell":
 		break
 	default:
 		return nil, fmt.Errorf("unsupported node type: %s", c.NodeType)
@@ -274,7 +276,11 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 
 		u.DeviceLimit = c.DeviceLimit // todo waiting v2board send configuration
 		u.Email = u.UUID + "@v2board.user"
-		if c.NodeType == "Shadowsocks" || c.NodeType == "AnyTLS" || c.NodeType == "Hysteria" {
+		// Protocols whose per-user secret is the raw uuid rather than a
+		// derived id. For Snell this becomes the ClientID sent in the request
+		// header, and only in multi_user mode (see the controller).
+		switch c.NodeType {
+		case "Shadowsocks", "AnyTLS", "Hysteria", "Snell":
 			u.Passwd = u.UUID
 		}
 		userList[i] = u
@@ -403,6 +409,42 @@ func (c *APIClient) parseHysteriaNodeResponse(s *serverConfig) (*api.NodeInfo, e
 		HysteriaUpMbps:       s.UpMbps,
 		HysteriaDownMbps:     s.DownMbps,
 		NameServerConfig:     s.parseDNSConfig(),
+	}, nil
+}
+
+// parseSnellNodeResponse parses a Snell node config. Snell speaks neither TLS
+// nor a pluggable transport, so EnableTLS stays false and the controller never
+// asks for a certificate: the psk is the entire handshake, and v6 derives its
+// per-deployment traffic profile from it.
+func (c *APIClient) parseSnellNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
+	version := s.Version
+	if version == 0 {
+		// Match keeper's admin editor, which seeds new Snell nodes with
+		// version 6 and only writes the key once it is touched.
+		version = 6
+	}
+
+	// keeper's Snell editor writes "off" for "no obfuscation", but sing-snell
+	// only understands "" / "none" / "http" / "tls" and errors on anything else.
+	obfs := s.Obfs
+	if obfs == "off" {
+		obfs = ""
+	}
+
+	return &api.NodeInfo{
+		NodeType:          c.NodeType,
+		NodeID:            c.NodeID,
+		Port:              uint32(s.ServerPort),
+		TransportProtocol: "tcp",
+		EnableTLS:         false,
+		SnellVersion:      version,
+		SnellPSK:          s.PSK,
+		SnellMode:         s.SnellMode,
+		// Read off the outer field, not the embedded snell struct — see the
+		// Obfs comment in model.go for why the embedded one never populates.
+		SnellObfs:        obfs,
+		SnellMultiUser:   s.MultiUser,
+		NameServerConfig: s.parseDNSConfig(),
 	}, nil
 }
 

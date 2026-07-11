@@ -13,7 +13,7 @@
 
 A Xray backend framework that can easily support many panels.
 
-一个基于Xray的后端框架，支持 V2ray/Vmess/Vless、Trojan、Shadowsocks、AnyTLS、Hysteria/Hysteria2 (hy2) 协议，极易扩展，支持多面板对接。
+一个基于Xray的后端框架，支持 V2ray/Vmess/Vless、Trojan、Shadowsocks、AnyTLS、Hysteria/Hysteria2 (hy2)、Snell (v5/v6) 协议，极易扩展，支持多面板对接。
 
 如果您喜欢本项目，可以右上角点个star+watch，持续关注本项目的进展。
 
@@ -27,9 +27,9 @@ A Xray backend framework that can easily support many panels.
 ## 特点
 
 * 永久开源且免费。
-* 支持 V2ray/Vmess/Vless、Trojan、Shadowsocks、AnyTLS、Hysteria/Hysteria2 (hy2) 等多种协议。
+* 支持 V2ray/Vmess/Vless、Trojan、Shadowsocks、AnyTLS、Hysteria/Hysteria2 (hy2)、Snell (v5/v6) 等多种协议。
 * 支持 Vless/XTLS/REALITY 等新特性。
-* AnyTLS/Hysteria/Hysteria2 使用 sing-box 控制器。
+* AnyTLS/Snell 使用 sing-box 控制器（不经过 xray 分发器，故不支持按用户限速/设备数限制/审计规则）。
 * 支持单实例对接多面板、多节点，无需重复启动。
 * 支持限制在线IP
 * 支持节点端口级别、用户级别限速。
@@ -54,7 +54,20 @@ A Xray backend framework that can easily support many panels.
 | 按照用户限速    | √     | √      | √           |
 | 自定义DNS    | √     | √      | √           |
 
-说明：AnyTLS/Hysteria/Hysteria2 由 sing-box 控制器提供支持，功能覆盖以面板下发配置及 sing-box 能力为准。
+说明：AnyTLS/Snell 由 sing-box 控制器提供支持，功能覆盖以面板下发配置及 sing-box 能力为准。
+
+### Snell 的两种用户模式（部署前必读）
+
+Snell 把每用户密钥放在协议的 ClientID 字段里，而官方 Surge 客户端**没有**设置 client-id 的配置项。因此下面两种模式**不可兼得**，由面板 `protocol_settings.multi_user` 决定：
+
+| `multi_user` | 官方 Surge 客户端 | 按用户计流量 / 限速 / 封禁 |
+|---|---|---|
+| `false`（默认） | ✅ 可连接 | ❌ 无法识别用户，流量上报恒为 0；踢人需给所有人换 psk |
+| `true` | ❌ 连不上（空 client-id 会被拒） | ✅ 用户 uuid 即为密钥，正常计费 |
+
+XrayR 只能服务 Snell v5 / v6；v3、v4 请继续使用外部 snell-server。v6 的 psk 长度必须为 12–255 字节。
+
+注意：**v5 不能开 `multi_user`** —— Surge 能连 v5 但发不出 client-id，而能发 client-id 的 sing-box 系客户端又没有实现 v5 客户端，这个组合开出来的节点没有任何客户端连得上。XrayR 会在启动时直接报错拒绝。要多用户计费请用 v6。
 
 ## 支持前端
 
@@ -62,7 +75,7 @@ A Xray backend framework that can easily support many panels.
 |--------------------------------------------------------|-------|--------|-------------------------|
 | keeper (V2board 兼容)                                   | √     | √      | √                       |
 
-说明：AnyTLS/Hysteria/Hysteria2 当前通过 keeper（UniProxy API）下发配置；其它面板请以实际支持为准。
+说明：AnyTLS/Hysteria/Hysteria2/Snell 当前通过 keeper（UniProxy API）下发配置；其它面板请以实际支持为准。
 
 ## 软件安装
 

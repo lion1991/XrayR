@@ -86,6 +86,17 @@ type NodeInfo struct {
 	HysteriaObfsPassword string
 	HysteriaUpMbps       int
 	HysteriaDownMbps     int
+	// Snell. There is no TLS and no transport here: the psk is the whole
+	// handshake, and v6 derives its traffic profile from that psk.
+	SnellVersion int    // 5 or 6 (sing-box serves those two)
+	SnellPSK     string // node-wide shared key; v6 requires 12-255 bytes
+	SnellMode    string // v6 only: default | unshaped | unsafe-raw
+	SnellObfs    string // v5 only: none | http | tls
+	// SnellMultiUser picks between the two mutually exclusive user models.
+	// See the Snell case in singbox_controller.go for why they cannot be had
+	// at once: false = one shared psk (Surge connects, no per-user metering),
+	// true = per-user keys (metering works, official Surge cannot connect).
+	SnellMultiUser bool
 }
 
 type UserInfo struct {

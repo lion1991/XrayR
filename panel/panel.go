@@ -179,6 +179,9 @@ func (p *Panel) Start() {
 			if strings.EqualFold(nodeConfig.ApiConfig.NodeType, "hysteria") || strings.EqualFold(nodeConfig.ApiConfig.NodeType, "hysteria2") {
 				nodeConfig.ApiConfig.NodeType = "Hysteria"
 			}
+			if strings.EqualFold(nodeConfig.ApiConfig.NodeType, "snell") {
+				nodeConfig.ApiConfig.NodeType = "Snell"
+			}
 		}
 		var apiClient api.API
 		switch nodeConfig.PanelType {
@@ -200,9 +203,10 @@ func (p *Panel) Start() {
 		// v1.260327 added a native Hysteria 2 inbound + QUIC transport. We
 		// route it through the standard controller now so it benefits from
 		// the same dispatcher path (rate limiter + device tracking) as
-		// Trojan/VMess/etc. AnyTLS has no xray-core equivalent yet, so it
-		// stays on sing-box.
-		if strings.EqualFold(nodeType, "AnyTLS") {
+		// Trojan/VMess/etc. AnyTLS and Snell have no xray-core equivalent, so
+		// they stay on sing-box — which also means they miss the dispatcher's
+		// speed limiter, device limiter and audit rules.
+		if strings.EqualFold(nodeType, "AnyTLS") || strings.EqualFold(nodeType, "Snell") {
 			controllerService = controller.NewSingBoxController(apiClient, controllerConfig, nodeConfig.PanelType)
 		} else {
 			controllerService = controller.New(server, apiClient, controllerConfig, nodeConfig.PanelType)

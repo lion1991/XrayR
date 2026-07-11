@@ -4,7 +4,7 @@
 # PanelType is "Keeper" — the client that speaks keeper's UniProxy API.
 # One entry under Nodes: per node; below is one of every protocol
 # keeper + this XrayR fork support: Shadowsocks, VMess, VLESS (+REALITY), Trojan,
-# Hysteria2, AnyTLS.
+# Hysteria2, AnyTLS, Snell.
 #
 # Design: the panel drives the inbound shape (port, transport, TLS, SNI, cipher,
 # flow, REALITY keys, obfs, bandwidth, padding). The node only declares its
@@ -121,6 +121,37 @@ Nodes:
         Email: you@example.com
         DNSEnv:
           CF_DNS_API_TOKEN: your_token
+
+  # --- 8. Snell — sing-box controller, NO TLS, so no CertConfig ------------
+  # Everything comes from the panel's protocol_settings: psk, version (XrayR
+  # serves v5 and v6 — for v3/v4 keep using an external snell-server), mode
+  # (v6: default/unshaped/unsafe-raw) and obfs (v5 only). The v6 psk must be
+  # 12-255 bytes; v6 derives the node's traffic fingerprint from it.
+  #
+  # READ THIS BEFORE DEPLOYING — the panel's `multi_user` flag picks between two
+  # user models that cannot coexist, because Snell carries the per-user key in
+  # its ClientID field and the official Surge client has no option to send one:
+  #
+  #   multi_user: false (default) — one shared psk. Official Surge connects.
+  #     But no user is identifiable, so this node reports ZERO traffic: it
+  #     cannot bill, rate-limit or ban anyone, and kicking one user means
+  #     rotating the psk for everybody.
+  #   multi_user: true — each user's uuid is their key. Traffic is metered per
+  #     user like any other node. But official Surge CANNOT CONNECT; only
+  #     sing-box-family clients can. v6 ONLY: v5 + multi_user is unreachable by
+  #     every client that exists (Surge sends no client-id; sing-box ships no v5
+  #     client), so XrayR refuses to start such a node.
+  #
+  # Note: Snell (like AnyTLS) runs on the sing-box controller, which bypasses
+  # the xray dispatcher — so SpeedLimit, DeviceLimit and audit rules do not
+  # apply to it, and new users are picked up on node restart, not on the next
+  # pull.
+  - PanelType: "Keeper"
+    ApiConfig:
+      ApiHost: "https://your.domain"
+      ApiKey: "节点通讯密钥"
+      NodeID: 8
+      NodeType: Snell
 
 # ============================================================================
 # Full ControllerConfig reference — every field you MAY set. ALL optional; the

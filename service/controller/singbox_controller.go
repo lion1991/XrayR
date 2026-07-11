@@ -10,6 +10,7 @@ import (
 	"time"
 
 	sb "github.com/sagernet/sing-box"
+	sbcertificate "github.com/sagernet/sing-box/adapter/certificate"
 	sbendpoint "github.com/sagernet/sing-box/adapter/endpoint"
 	sbinbound "github.com/sagernet/sing-box/adapter/inbound"
 	sboutbound "github.com/sagernet/sing-box/adapter/outbound"
@@ -21,6 +22,7 @@ import (
 	sbanytls "github.com/sagernet/sing-box/protocol/anytls"
 	sbhysteria "github.com/sagernet/sing-box/protocol/hysteria"
 	sbhysteria2 "github.com/sagernet/sing-box/protocol/hysteria2"
+	sbsnell "github.com/sagernet/sing-box/protocol/snell"
 	"github.com/sagernet/sing/common/json/badoption"
 	log "github.com/sirupsen/logrus"
 	"github.com/xtls/xray-core/common/task"
@@ -156,7 +158,9 @@ func (c *SingBoxController) buildUserTag(user *api.UserInfo) string {
 
 func (c *SingBoxController) startSingBox() error {
 	nodeType := strings.ToLower(c.nodeInfo.NodeType)
-	if nodeType != "anytls" && nodeType != "hysteria" {
+	switch nodeType {
+	case "anytls", "hysteria", "snell":
+	default:
 		return fmt.Errorf("unsupported node type for sing-box controller: %s", c.nodeInfo.NodeType)
 	}
 	if c.nodeInfo.Port > 65535 {
@@ -295,6 +299,88 @@ func (c *SingBoxController) startSingBox() error {
 			inboundType = sbc.TypeHysteria
 			inboundOptions = hOptions
 		}
+	case "snell":
+		sbsnell.RegisterInbound(inReg)
+		version := c.nodeInfo.SnellVersion
+		// sing-box serves v5 and v6 only — its v4 support is client-side.
+		// Reject here rather than let sing-snell fail deeper in with an error
+		// the operator can't trace back to a panel field.
+		if version != 5 && version != 6 {
+			return fmt.Errorf("snell: unsupported version %d (sing-box serves 5 or 6)", version)
+		}
+		psk := c.nodeInfo.SnellPSK
+		if psk == "" {
+			return errors.New("snell: psk is required but the panel sent none")
+		}
+		// Mirrors snell-server v6's own check, which sing-snell reproduces.
+		if version == 6 && (len(psk) < 12 || len(psk) > 255) {
+			return fmt.Errorf("snell: v6 psk must be 12-255 bytes, panel sent %d", len(psk))
+		}
+
+		snellOptions := &sboption.SnellInboundOptions{
+			ListenOptions: lo,
+			Version:       version,
+			PSK:           psk,
+		}
+		if version == 6 {
+			snellOptions.V6Options = sboption.SnellV6Options{Mode: c.nodeInfo.SnellMode}
+		} else {
+			snellOptions.ObfsOptions = sboption.SnellObfsServerOptions{ObfsMode: c.nodeInfo.SnellObfs}
+		}
+
+		// The two user models are mutually exclusive, and the choice is the
+		// panel's (multi_user in protocol_settings):
+		//
+		//   multi_user=false — one shared psk. Any client holding it connects,
+		//     including official Surge. Nobody is identified, so metadata.User
+		//     is blank, the traffic tracker attributes nothing, and this node
+		//     reports zero usage to the panel. Unmetered by construction.
+		//
+		//   multi_user=true — each user's uuid is their Snell key, which rides
+		//     in the request's ClientID field. That gives us per-user traffic
+		//     and lets sing-snell reject unknown keys. But Surge has no config
+		//     option for a client id: it sends an empty one and sing-snell
+		//     turns that into ErrBadUserKey, so official Surge clients cannot
+		//     connect to a node in this mode. Only sing-box-family clients can.
+		if c.nodeInfo.SnellMultiUser {
+			// v5 + multi_user is a node no client can reach, so refuse to boot
+			// one rather than let it sit there looking healthy: official Surge
+			// speaks v5 but cannot send a client-id, and the only clients that
+			// can send one are sing-box-family — which implement no v5 client
+			// at all (sing-snell ships snellv5/server.go with no client.go).
+			if version == 5 {
+				return errors.New("snell: version 5 with multi_user has no reachable client — Surge cannot send a client-id and sing-box has no v5 client. Use version 6, or turn multi_user off")
+			}
+			// sing-box picks the service implementation off len(Users): an
+			// empty list builds the SHARED-PSK service, not a multi-user one
+			// that admits nobody. Booting here would silently invert the
+			// operator's intent — any psk holder connects, nobody is metered.
+			// keeper's GetUserList already errors on an empty list ("users is
+			// null"), but that invariant lives a repo away; pin it locally.
+			if len(*c.userList) == 0 {
+				return errors.New("snell: multi_user is on but the panel sent zero users — refusing to boot: sing-box would fall back to shared-psk mode and admit any psk holder unmetered")
+			}
+			users := make([]sboption.SnellUser, 0, len(*c.userList))
+			for _, user := range *c.userList {
+				key := user.Passwd
+				if key == "" {
+					key = user.UUID
+				}
+				if key == "" {
+					return fmt.Errorf("snell user %d has empty password/uuid", user.UID)
+				}
+				users = append(users, sboption.SnellUser{
+					Name:    c.buildUserTag(&user),
+					UserKey: key,
+				})
+			}
+			snellOptions.Users = users
+		} else {
+			c.logger.Warn("snell: shared-psk mode — all users share the node psk, so no traffic can be attributed and this node will report zero usage to the panel. Set multi_user on the node to meter users (note: official Surge clients cannot connect in that mode).")
+		}
+
+		inboundType = sbc.TypeSnell
+		inboundOptions = snellOptions
 	}
 
 	ctx := context.Background()
@@ -311,6 +397,10 @@ func (c *SingBoxController) startSingBox() error {
 		sbendpoint.NewRegistry(),
 		dnsTransportReg,
 		sbservice.NewRegistry(),
+		// sing-box v1.14 added a certificate-provider registry to the context.
+		// We issue no certificates from providers (CertConfig hands us files on
+		// disk), but box.New dereferences the registry, so it must be present.
+		sbcertificate.NewRegistry(),
 	)
 
 	traffic := newSingBoxTrafficTracker(c.logger)

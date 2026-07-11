@@ -16,9 +16,11 @@ require (
 	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/r3labs/diff/v2 v2.15.1
 	github.com/redis/go-redis/v9 v9.7.0
-	github.com/sagernet/sing v0.8.10
-	github.com/sagernet/sing-box v1.13.12
+	github.com/sagernet/sing v0.8.12-0.20260702081104-2ded2af32d3d
+	github.com/sagernet/sing-box v1.14.0-alpha.43
 	github.com/sagernet/sing-shadowsocks v0.2.8
+	github.com/sagernet/sing-snell v0.0.0-20260710094516-a4e97ee24beb
+	github.com/sagernet/sing-tun v0.8.12-0.20260710165757-8c8594272daa
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.10.2
@@ -58,6 +60,7 @@ require (
 	github.com/Joker/jade v1.1.3 // indirect
 	github.com/OpenDNS/vegadns2client v0.0.0-20180418235048-a3fa4a771d87 // indirect
 	github.com/Shopify/goreferrer v0.0.0-20220729165902-8cddb4f5de06 // indirect
+	github.com/ajg/form v1.5.1 // indirect
 	github.com/akamai/AkamaiOPEN-edgegrid-golang v1.2.2 // indirect
 	github.com/aliyun/alibaba-cloud-sdk-go v1.62.695 // indirect
 	github.com/andybalholm/brotli v1.1.0 // indirect
@@ -84,7 +87,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/boombuler/barcode v1.0.1 // indirect
 	github.com/bytedance/sonic v1.11.3 // indirect
-	github.com/caddyserver/certmagic v0.25.2 // indirect
+	github.com/caddyserver/certmagic v0.25.3-0.20260421143802-60d9d8b415d6 // indirect
 	github.com/caddyserver/zerossl v0.1.5 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -110,6 +113,7 @@ require (
 	github.com/gin-contrib/sse v0.1.0 // indirect
 	github.com/gin-gonic/gin v1.9.1 // indirect
 	github.com/go-chi/chi/v5 v5.2.5 // indirect
+	github.com/go-chi/render v1.0.3 // indirect
 	github.com/go-errors/errors v1.5.1 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
@@ -134,6 +138,7 @@ require (
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
+	github.com/google/gopacket v1.1.19 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.6 // indirect
@@ -149,13 +154,16 @@ require (
 	github.com/hashicorp/go-uuid v1.0.3 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
+	github.com/huin/goupnp v1.2.0 // indirect
 	github.com/iij/doapi v0.0.0-20190504054126-0bbf12d6d7df // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/infobloxopen/infoblox-go-client v1.1.1 // indirect
 	github.com/insomniacslk/dhcp v0.0.0-20260220084031-5adc3eb26f91 // indirect
 	github.com/iris-contrib/schema v0.0.6 // indirect
+	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
+	github.com/jsimonetti/rtnetlink v1.4.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/juju/ratelimit v1.0.2 // indirect
 	github.com/k0kubun/go-ansi v0.0.0-20180517002512-3bf9e2903213 // indirect
@@ -168,6 +176,7 @@ require (
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/kolo/xmlrpc v0.0.0-20220921171641-a4b6fa1dd06b // indirect
+	github.com/koron/go-ssdp v0.0.4 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/labbsr0x/bindman-dns-webhook v1.0.2 // indirect
 	github.com/labbsr0x/goh v1.0.1 // indirect
@@ -178,6 +187,8 @@ require (
 	github.com/libdns/alidns v1.0.6 // indirect
 	github.com/libdns/cloudflare v0.2.2 // indirect
 	github.com/libdns/libdns v1.1.1 // indirect
+	github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138 // indirect
+	github.com/libp2p/go-netroute v0.2.1 // indirect
 	github.com/linode/linodego v1.30.0 // indirect
 	github.com/liquidweb/liquidweb-cli v0.7.0 // indirect
 	github.com/liquidweb/liquidweb-go v1.6.4 // indirect
@@ -244,11 +255,11 @@ require (
 	github.com/sagernet/fswatch v0.1.2 // indirect
 	github.com/sagernet/gvisor v0.0.0-20250811.0-sing-box-mod.1 // indirect
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a // indirect
-	github.com/sagernet/nftables v0.3.0-mod.2 // indirect
+	github.com/sagernet/nftables v0.3.0-mod.3 // indirect
 	github.com/sagernet/quic-go v0.59.0-sing-box-mod.4 // indirect
-	github.com/sagernet/sing-mux v0.3.4 // indirect
-	github.com/sagernet/sing-quic v0.6.1 // indirect
-	github.com/sagernet/sing-tun v0.8.9 // indirect
+	github.com/sagernet/sing-mux v0.3.5 // indirect
+	github.com/sagernet/sing-quic v0.6.4-0.20260709034545-e23afe1172dc // indirect
+	github.com/sagernet/sing-usbip v0.0.0-20260616101517-efb91521eddb // indirect
 	github.com/sagernet/sing-vmess v0.2.8-0.20250909125414-3aed155119a1 // indirect
 	github.com/sagernet/smux v1.5.50-sing-box-mod.1 // indirect
 	github.com/sagikazarmark/locafero v0.4.0 // indirect

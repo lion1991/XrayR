@@ -10,15 +10,25 @@ type serverConfig struct {
 	trojan
 	anytls
 	hysteria
+	snell
 
-	// Obfs is declared at the outer level on purpose — both `shadowsocks`
-	// and `hysteria` define an embedded `Obfs string \`json:"obfs"\``
+	// Obfs is declared at the outer level on purpose — `shadowsocks` and
+	// `hysteria` both define an embedded `Obfs string \`json:"obfs"\``
 	// field, and Go's encoding/json ignores keys whose target is
 	// ambiguous between two same-depth embedded fields. By shadowing them
 	// from a less-deep struct level, this single field captures the JSON
-	// `obfs` value for whichever protocol the node speaks (the two are
-	// mutually exclusive in practice).
+	// `obfs` value for whichever protocol the node speaks (they are
+	// mutually exclusive in practice). `snell` deliberately embeds no obfs
+	// field of its own and is parsed off this outer one too — adding one
+	// there would be harmless but pointless (it could never populate).
 	Obfs string `json:"obfs"`
+
+	// Version is hoisted here for exactly the same reason, and the stakes are
+	// higher: `hysteria` and `snell` both carry a `version` key, so leaving one
+	// in each embedded struct would make encoding/json silently drop BOTH — and
+	// a Hysteria node whose version decodes to 0 instead of 2 quietly downgrades
+	// itself from Hy2 to Hy1 rather than failing. One field, one level up.
+	Version int `json:"version"`
 
 	ServerPort int `json:"server_port"`
 	BaseConfig struct {
@@ -98,12 +108,26 @@ type anytls struct {
 }
 
 type hysteria struct {
-	Version            int    `json:"version"`
 	HysteriaServerName string `json:"server_name"`
 	UpMbps             int    `json:"up_mbps"`
 	DownMbps           int    `json:"down_mbps"`
 	HysteriaObfs       string `json:"obfs"`
 	HysteriaObfsPwd    string `json:"obfs-password"`
+}
+
+// snell holds the node-level Snell parameters. Snell has neither TLS nor a
+// pluggable transport, so this is the whole node config: a shared psk, plus
+// either `mode` (v6 traffic shaping) or `obfs` (v5 obfuscation, read off the
+// outer Obfs field above).
+//
+// MultiUser selects the user model. It is a protocol fork, not a tuning knob:
+// Snell carries the per-user key in the request's ClientID field, which the
+// official Surge client never sends. See the Snell case in
+// service/controller/singbox_controller.go.
+type snell struct {
+	PSK       string `json:"psk"`
+	SnellMode string `json:"mode"`
+	MultiUser bool   `json:"multi_user"`
 }
 
 type route struct {
