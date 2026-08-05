@@ -318,9 +318,11 @@ func (c *SingBoxController) startSingBox() error {
 		}
 
 		snellOptions := &sboption.SnellInboundOptions{
-			ListenOptions: lo,
-			Version:       version,
-			PSK:           psk,
+			Version: version,
+			AbstractSnellInboundOptions: sboption.AbstractSnellInboundOptions{
+				ListenOptions: lo,
+				PSK:           psk,
+			},
 		}
 		if version == 6 {
 			snellOptions.V6Options = sboption.SnellV6Options{Mode: c.nodeInfo.SnellMode}

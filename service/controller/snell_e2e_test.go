@@ -1,6 +1,7 @@
 package controller_test
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,12 @@ import (
 
 // v6 rejects a psk outside 12..255 bytes, mirroring snell-server's own check.
 const snellTestPSK = "0123456789abcdef"
+
+// This PSK yields a default-mode stream chunk limit below a normal 1400-byte
+// UDP datagram, which distinguishes the v6 beta4 and RC1 packet behavior.
+const snellV6RCUDPTestPSK = "snell-rc-udp-0371991"
+
+const snellV6RCUDPPayloadSize = 1400
 
 const snellTestUUID = "11111111-2222-3333-4444-555555555555"
 
@@ -108,8 +115,34 @@ func startEchoServer(t *testing.T) string {
 	return l.Addr().String()
 }
 
+func startUDPEchoServer(t *testing.T) *net.UDPAddr {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("udp echo listen: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	go func() {
+		buffer := make([]byte, 64*1024)
+		for {
+			n, addr, readErr := conn.ReadFromUDP(buffer)
+			if readErr != nil {
+				return
+			}
+			if _, writeErr := conn.WriteToUDP(buffer[:n], addr); writeErr != nil {
+				return
+			}
+		}
+	}()
+	return conn.LocalAddr().(*net.UDPAddr)
+}
+
 // startSnellNode boots a real SingBoxController against the fake panel.
 func startSnellNode(t *testing.T, multiUser bool) (*fakeSnellAPI, string) {
+	return startSnellNodeWithPSK(t, multiUser, snellTestPSK)
+}
+
+func startSnellNodeWithPSK(t *testing.T, multiUser bool, psk string) (*fakeSnellAPI, string) {
 	t.Helper()
 	port := freePort(t)
 	f := &fakeSnellAPI{
@@ -119,7 +152,7 @@ func startSnellNode(t *testing.T, multiUser bool) (*fakeSnellAPI, string) {
 			Port:              uint32(port),
 			TransportProtocol: "tcp",
 			SnellVersion:      6,
-			SnellPSK:          snellTestPSK,
+			SnellPSK:          psk,
 			SnellMode:         "default",
 			SnellMultiUser:    multiUser,
 		},
@@ -182,6 +215,53 @@ func echoThrough(conn net.Conn, payload string) (string, error) {
 		return "", err
 	}
 	return string(buf), nil
+}
+
+// Snell v6 RC1 writes each UDP datagram as one record even when its payload is
+// larger than the current stream chunk limit. The beta4 behavior rejected this
+// packet before it reached the server.
+func TestSnellV6DefaultModeProxiesRC1SizedUDPDatagram(t *testing.T) {
+	echo := startUDPEchoServer(t)
+	_, nodeAddr := startSnellNodeWithPSK(t, false, snellV6RCUDPTestPSK)
+
+	client, err := snellv6.NewClient(snellv6.ClientOptions{
+		PSK:  []byte(snellV6RCUDPTestPSK),
+		Mode: snellv6.ModeDefault,
+	})
+	if err != nil {
+		t.Fatalf("create Snell v6 client: %v", err)
+	}
+	raw, err := net.Dial("tcp", nodeAddr)
+	if err != nil {
+		t.Fatalf("connect to Snell node: %v", err)
+	}
+	packetConn, err := client.DialPacketConn(raw)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatalf("open Snell UDP tunnel: %v", err)
+	}
+	t.Cleanup(func() { _ = packetConn.Close() })
+	if err := packetConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set Snell UDP deadline: %v", err)
+	}
+
+	payload := bytes.Repeat([]byte{0x5a}, snellV6RCUDPPayloadSize)
+	n, err := packetConn.WriteTo(payload, echo)
+	if err != nil {
+		t.Fatalf("proxy a %d-byte UDP datagram through Snell v6 default mode: %v", len(payload), err)
+	}
+	if n != len(payload) {
+		t.Fatalf("Snell UDP write length = %d, want %d", n, len(payload))
+	}
+
+	received := make([]byte, 2048)
+	n, _, err = packetConn.ReadFrom(received)
+	if err != nil {
+		t.Fatalf("read Snell UDP echo: %v", err)
+	}
+	if !bytes.Equal(received[:n], payload) {
+		t.Fatalf("Snell UDP echo mismatch: received %d bytes", n)
+	}
 }
 
 // TestSnellV6MultiUserMetersTrafficAndRejectsSurge pins down the multi_user
