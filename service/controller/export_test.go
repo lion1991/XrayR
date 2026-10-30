@@ -5,7 +5,11 @@ import "github.com/XrayR-project/XrayR/api"
 // NewTestSingBoxController builds a node that may reach the local servers
 // tests dial.
 func NewTestSingBoxController(apiClient api.API, config *Config) *SingBoxController {
-	c := NewSingBoxController(apiClient, config, "Keeper", SingBoxLog{})
+	return NewTestSingBoxControllerLogging(apiClient, config, SingBoxLog{})
+}
+
+func NewTestSingBoxControllerLogging(apiClient api.API, config *Config, logConfig SingBoxLog) *SingBoxController {
+	c := NewSingBoxController(apiClient, config, "Keeper", logConfig)
 	c.allowPrivate = true
 	return c
 }

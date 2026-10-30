@@ -5,7 +5,7 @@ Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，P4 取消�
 ## 背景与目标
 
 - 现状：VMess / VLESS（含 Reality）/ Trojan / Shadowsocks / Hysteria2 走 Xray-core（`service/controller/controller.go`），AnyTLS、Snell 走上游 sing-box（`singbox_controller.go`，依赖 v1.15.0-alpha.3）。要同时追两个内核，Xray 侧还维护着一份分叉的 dispatcher（`app/mydispatcher`）。
-- 客户端统一用 wkernel（`../wkernel`，sing-box 分支，XrayR 当前依赖 `v1.15.0-alpha.13-w.2`，module 名仍是 `github.com/sagernet/sing-box`）。
+- 客户端统一用 wkernel（`../wkernel`，sing-box 分支，XrayR 当前依赖 `v1.15.0-alpha.13-w.3`，module 名仍是 `github.com/sagernet/sing-box`）。
 - 目标：服务端只依赖 wkernel 一个内核，两端协议实现同源；删除 Xray-core 依赖和 `app/mydispatcher`。
 - 不做：改动面板（keeper）协议；新增客户端功能。
 
@@ -148,6 +148,8 @@ Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，P4 取消�
     - 测试要连本机的回显服务，用只在测试里可见的开关关掉这项检查，其余规则不变。
   - 屏蔽 BT：只拦 TCP 握手（`network: tcp` + `protocol: bittorrent`，要开 sniff）。sing-box 的 uTP 嗅探会把 WireGuard 握手（`01 00 00 00` 开头）和 RakNet ping 判成 BitTorrent，Xray 的 uTP 嗅探实际从不命中，所以 Xray 节点一直只拦 TCP。
   - 日志量：sing-box 把扫描器的握手失败、认证失败、拨号失败都记成 ERROR（Xray 记在 Info），`Level: warning` 下 ErrorPath 会比 Xray 时期多出这些行。
+    - 降到 Debug 的只有两种连接正常结束（canary 上发现，2026-10-30）：Hysteria 2 客户端在节点应答前主动取消流（`report handshake success` + 对端 `StreamError` 错误码 0），VLESS 客户端在帧之间关闭 mux/XUDP 连接（`mux connection closed: read frame header: EOF`；帧读到一半是 `ErrUnexpectedEOF`，仍是 ERROR）。判断在 `singbox_log.go`，按错误类型匹配，通过 wkernel 日志包的 `ContextWithLevelRewriter` 接入（sing-box 的日志器在 `box.New` 里创建，XrayR 没有别的地方能插手）。
+    - 不降：REALITY 的 `processed invalid connection`。扫描器探测会报它，伪装目标的握手不合 REALITY（不支持 TLS 1.3、密钥交换不匹配）时所有真用户也报同一句，消息上分不出来。
   - `SendIP` 只绑一个协议族，另一族从系统默认地址出去（Xray 的 Go dialer 会只用 SendIP 那一族）；节点都没有 IPv6，暂不处理。Xray 的 `origin` / `srcip` 写法不支持，节点启动报错。
   - 代码里构造的拒绝规则必须显式写 `method: default`：JSON 解析才会补默认值，空的 method 一命中路由就 panic。
 

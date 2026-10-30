@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -67,6 +69,11 @@ type realityNode struct {
 // one (tls 2), with no certificate configured.
 func startVLESSNode(t *testing.T, change func(*api.NodeInfo, *Config)) *realityNode {
 	t.Helper()
+	return startVLESSNodeLogging(t, SingBoxLog{}, change)
+}
+
+func startVLESSNodeLogging(t *testing.T, logConfig SingBoxLog, change func(*api.NodeInfo, *Config)) *realityNode {
+	t.Helper()
 	key, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +109,7 @@ func startVLESSNode(t *testing.T, change func(*api.NodeInfo, *Config)) *realityN
 		nodeInfo: nodeInfo,
 		users:    []api.UserInfo{{UID: 42, UUID: snellTestUUID, Email: snellTestUUID + "@v2board.user"}},
 	}
-	c := NewTestSingBoxController(f, config)
+	c := NewTestSingBoxControllerLogging(f, config, logConfig)
 	if err := c.Start(); err != nil {
 		t.Fatalf("start VLESS node: %v", err)
 	}
@@ -349,6 +356,65 @@ func TestVLESSRealityNodeVariants(t *testing.T) {
 				t.Fatalf("short id %s proxies", tc.refused)
 			}
 		})
+	}
+}
+
+// A client closing its XUDP connection is a normal end, logged at debug. A
+// REALITY probe stays an error: an unsuitable target fails real users with
+// the same message.
+func TestVLESSNodeLogsNormalEndsAtDebug(t *testing.T) {
+	udpEcho := startUDPEchoServer(t)
+	logPath := filepath.Join(t.TempDir(), "sing-box.log")
+	node := startVLESSNodeLogging(t, SingBoxLog{Level: "debug", Path: logPath}, func(nodeInfo *api.NodeInfo, _ *Config) {
+		nodeInfo.VlessFlow = ""
+	})
+	logLine := func(what string) string {
+		var line string
+		waitFor(t, what+" to be logged", func() bool {
+			data, _ := os.ReadFile(logPath)
+			for _, l := range strings.Split(string(data), "\n") {
+				if strings.Contains(l, what) {
+					line = l
+					return true
+				}
+			}
+			return false
+		})
+		return line
+	}
+
+	probe, err := tls.Dial("tcp", node.addr, &tls.Config{ServerName: "node.test", InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatalf("probe handshake: %v", err)
+	}
+	_ = probe.Close()
+	if line := logLine("REALITY: processed invalid connection"); !strings.Contains(line, " ERROR ") {
+		t.Errorf("the probe is not logged as an error: %s", line)
+	}
+
+	tlsConn, err := node.realityConn(t, "aabbccdd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := vless.NewClient(snellTestUUID, "", logger.NOP())
+	if err != nil {
+		t.Fatal(err)
+	}
+	packetConn, err := client.DialEarlyXUDPPacketConn(tlsConn, M.SocksaddrFromNet(udpEcho))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tlsConn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := packetConn.WriteTo([]byte("datagram"), udpEcho); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := packetConn.ReadFrom(make([]byte, 64)); err != nil {
+		t.Fatalf("UDP echo: %v", err)
+	}
+	_ = packetConn.Close()
+	_ = tlsConn.Close()
+	if line := logLine("mux connection closed"); !strings.Contains(line, " DEBUG ") {
+		t.Errorf("the closed XUDP connection is not logged at debug: %s", line)
 	}
 }
 
