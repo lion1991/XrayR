@@ -180,11 +180,10 @@ Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，下一步 P
   - 用户密钥用密码（没有就用 UUID），和 Xray 一致；用户变化热更新不重建。
   - obfs（keeper 只发 salamander）、带宽直接映射到 sing-box 的 `obfs` / `up_mbps` / `down_mbps`；不认识的 obfs 类型由 sing-box 拒绝启动。ALPN 由 sing-quic 默认协商 `h3`，和 Xray 显式设置的一致。
   - 证书续期后重建 box（P1 已做）。
-  - 和 Xray 的带宽差异（照"沿用旧 sing-box 实现"做，是否改回待用户决定）：
-    - 服务端上行为 0（keeper 没填）时，Xray 一律用 BBR；sing-quic 只要客户端声明了下行带宽就用 Brutal，而且不封顶，客户端自己填多大就发多快。
-    - 只填了上行、下行为 0 时，Xray 回 `CC-RX: 0`，客户端上传用自己的 Brutal；sing-quic 回 `auto`，客户端改用 BBR。
-    - 单位：Xray 的 "N mbps" 是 N×1024×1024/8 B/s，sing-box 是 N×125000 B/s，同一个面板值低约 4.6%。
-    - 改回 Xray 的语义要动 wkernel（或 sing-quic）。
+  - 带宽为空时用 BBR（用户决定，2026-10-30）：上游 sing-quic 在服务端上行为 0（keeper 没填）时，只要客户端声明了下行带宽就按它跑 Brutal 且不封顶，客户端填多大就发多快。改成和 Xray 一样用 BBR。只改服务端自己的发送：回给客户端的 `CC-RX` 和上游一致，客户端上传照旧按它自己的配置跑 Brutal（服务端设了下行就按下行限速）。
+    - 这个判断写死在 sing-quic 里，只靠 sing-box 配置做不到（`ignore_client_bandwidth` 会把没声明带宽的客户端直接拒掉），所以 fork 了 sing-quic（`wrlog` 分支，补丁在 `congestionFor`），XrayR 用 replace 指过去（fork 推到 git.wrlog.cn 后再加；加之前 XrayR 仍是上游行为，回归用例靠 `XRAYR_SING_QUIC_FORK` 跳过，加 replace 时删掉这个跳过）。同步上游 sing-quic 时保留这个补丁。
+    - 回归用例：fork 里的 `TestCongestionFor`；XrayR 的 `TestHysteria2NodeWithoutBandwidthStaysOnBBR`（客户端声明 1 Mbps 下行，回显 512 KiB：fork 下毫秒级，上游被 Brutal 限速要约 10s），replace 丢了它就会失败。
+    - 和 Xray 仍有的差异：客户端没声明下行带宽时，Xray 照样回 `CC-RX: <服务端下行>`（为 0 时客户端上传用自己的 Brutal），sing-quic 回 `auto`，客户端上传改用 BBR。单位上 Xray 的 "N mbps" 是 N×1024×1024/8 B/s，sing-box 是 N×125000 B/s，同一个面板值低约 4.6%。
   - 上线后 sing-quic 用户表的数据竞争（见风险）进入生产：amd64 实际不出错，上 arm64 前必须修。
 
 每步都要验证：e2e 测试通过；灰度服务器的流量上报、在线 IP、限速和 Xray 时期一致；CPU 和吞吐不明显变差。

@@ -1,8 +1,11 @@
 package controller_test
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net"
+	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -50,6 +53,11 @@ func startHysteriaNode(t *testing.T, change func(*api.NodeInfo)) (*fakeSnellAPI,
 // ALPN h3.
 func hysteriaClient(t *testing.T, nodeAddr, password, salamander string) *hysteria2.Client {
 	t.Helper()
+	return hysteriaClientWith(t, nodeAddr, hysteria2.ClientOptions{SalamanderPassword: salamander, Password: password})
+}
+
+func hysteriaClientWith(t *testing.T, nodeAddr string, options hysteria2.ClientOptions) *hysteria2.Client {
+	t.Helper()
 	ctx := context.Background()
 	tlsConfig, err := sbtls.NewSTDClient(ctx, logger.NOP(), nodeAddr, sboption.OutboundTLSOptions{
 		Enabled:    true,
@@ -59,15 +67,9 @@ func hysteriaClient(t *testing.T, nodeAddr, password, salamander string) *hyster
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := hysteria2.NewClient(hysteria2.ClientOptions{
-		Context:            ctx,
-		Dialer:             N.SystemDialer,
-		Logger:             logger.NOP(),
-		ServerAddress:      M.ParseSocksaddr(nodeAddr),
-		SalamanderPassword: salamander,
-		Password:           password,
-		TLSConfig:          tlsConfig,
-	})
+	options.Context, options.Dialer, options.Logger = ctx, N.SystemDialer, logger.NOP()
+	options.ServerAddress, options.TLSConfig = M.ParseSocksaddr(nodeAddr), tlsConfig
+	client, err := hysteria2.NewClient(options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +159,44 @@ func TestHysteria2NodeServesSalamander(t *testing.T) {
 	}
 	if hysteriaProxies(t, nodeAddr, snellTestUUID, "", echo) {
 		t.Fatal("a client without obfs proxies")
+	}
+}
+
+// echoDuration times a payload's round trip through the node for a client
+// that declares a download rate of receiveBPS.
+func echoDuration(t *testing.T, nodeAddr string, receiveBPS uint64, echo string, size int) time.Duration {
+	t.Helper()
+	client := hysteriaClientWith(t, nodeAddr, hysteria2.ClientOptions{Password: snellTestUUID, ReceiveBPS: receiveBPS})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := client.DialConn(ctx, M.ParseSocksaddr(echo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	payload := bytes.Repeat([]byte("x"), size)
+	start := time.Now()
+	go func() { _, _ = conn.Write(payload) }()
+	if _, err := io.ReadFull(conn, make([]byte, size)); err != nil {
+		t.Fatalf("echo %d bytes: %v", size, err)
+	}
+	return time.Since(start)
+}
+
+// A node whose panel leaves the upload bandwidth empty sends on BBR, as Xray
+// did, instead of Brutal at whatever rate a client declares. Upstream sing-quic
+// paces this echo by Brutal at the declared 1 Mbps, around 10s on loopback;
+// BBR takes milliseconds. This needs the wrlog fork of sing-quic.
+func TestHysteria2NodeWithoutBandwidthStaysOnBBR(t *testing.T) {
+	if os.Getenv("XRAYR_SING_QUIC_FORK") == "" {
+		// This fails until go.mod replaces sing-quic with the fork.
+		t.Skip("needs the wrlog sing-quic fork; set XRAYR_SING_QUIC_FORK=1 to run")
+	}
+	echo := startEchoServer(t)
+	_, _, nodeAddr := startHysteriaNode(t, nil)
+	if elapsed := echoDuration(t, nodeAddr, 125_000, echo, 512<<10); elapsed > 2*time.Second {
+		t.Errorf("512 KiB took %v: the node sent on Brutal at the client's rate instead of BBR", elapsed)
 	}
 }
 
