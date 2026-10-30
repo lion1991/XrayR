@@ -2,6 +2,9 @@ package controller_test
 
 import (
 	"fmt"
+	"io"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +24,43 @@ func waitFor(t *testing.T, what string, done func() bool) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// startCountingEchoServer is an echo server that also counts what reaches
+// it, so a test can tell whether a cut-off client's upload still gets through.
+func startCountingEchoServer(t *testing.T) (addr string, received *atomic.Int64) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	received = new(atomic.Int64)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4096)
+				for {
+					n, err := c.Read(buf)
+					received.Add(int64(n))
+					if n > 0 {
+						if _, err := c.Write(buf[:n]); err != nil {
+							return
+						}
+					}
+					if err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+	return l.Addr().String(), received
 }
 
 // proxies reports whether a client holding userKey gets a payload echoed.
@@ -59,7 +99,10 @@ func TestSingBoxNodeFollowsPanelChanges(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 
-	established, err := snellDial(t, nodeAddr, snellTestUUID, echo)
+	// Its destination counts what arrives, to check the upload direction is
+	// cut too: snell's Close only half-closes a connection that has replied.
+	countingEcho, received := startCountingEchoServer(t)
+	established, err := snellDial(t, nodeAddr, snellTestUUID, countingEcho)
 	if err != nil {
 		t.Fatalf("dial as uid 42: %v", err)
 	}
@@ -80,14 +123,52 @@ func TestSingBoxNodeFollowsPanelChanges(t *testing.T) {
 	if c.BoxGeneration() != generation {
 		t.Fatal("a user change rebuilt the box instead of updating users in place")
 	}
-	// Disconnecting removed users is S3's job; until then the connection
-	// lives on, and its traffic must still reach the panel.
-	if _, err := echoThrough(established, "after"); err != nil {
-		t.Fatalf("established connection broke on a user update: %v", err)
+	// A removed user is cut off at once, both ways, and what they used
+	// before still reaches the panel.
+	arrived := received.Load()
+	_ = established.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = established.Write([]byte("after"))
+	_, err = io.ReadFull(established, make([]byte, 1))
+	// Give an upload that got through time to arrive.
+	time.Sleep(500 * time.Millisecond)
+	if err == nil {
+		t.Fatal("removed uid 42 keeps its established connection")
 	}
-	waitFor(t, "uid 42's traffic, including after removal, to be reported", func() bool {
+	if received.Load() != arrived {
+		t.Fatal("removed uid 42's upload still reaches the destination")
+	}
+	waitFor(t, "uid 42's traffic to be reported after removal", func() bool {
 		up, _ := f.trafficFor(42)
-		return up >= int64(len("before")+len("after"))
+		return up >= int64(len("before"))
+	})
+
+	// A new uuid for uid 43 is a new credential: the session on the old one
+	// is cut off, and the user stays on the box without a rebuild.
+	const snellTestUUID3 = "77777777-8888-9999-0000-111111111111"
+	onOldKey, err := snellDial(t, nodeAddr, snellTestUUID2, echo)
+	if err != nil {
+		t.Fatalf("dial as uid 43: %v", err)
+	}
+	defer onOldKey.Close()
+	if _, err := echoThrough(onOldKey, "old key"); err != nil {
+		t.Fatalf("proxy as uid 43: %v", err)
+	}
+	f.setUsers([]api.UserInfo{{UID: 43, UUID: snellTestUUID3, Email: "b@test"}})
+	waitFor(t, "uid 43's new uuid to be admitted", func() bool {
+		return proxies(t, nodeAddr, snellTestUUID3, echo)
+	})
+	if _, err := echoThrough(onOldKey, "still"); err == nil {
+		t.Fatal("a session on uid 43's old uuid survived the change")
+	}
+	if proxies(t, nodeAddr, snellTestUUID2, echo) {
+		t.Fatal("uid 43's old uuid still opens connections")
+	}
+	if c.BoxGeneration() != generation {
+		t.Fatal("a uuid change rebuilt the box")
+	}
+	f.setUsers([]api.UserInfo{{UID: 43, UUID: snellTestUUID2, Email: "b@test"}})
+	waitFor(t, "uid 43 back on its first uuid", func() bool {
+		return proxies(t, nodeAddr, snellTestUUID2, echo)
 	})
 
 	// A node info sing-box refuses keeps the old box serving, and its users

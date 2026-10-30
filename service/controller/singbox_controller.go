@@ -50,6 +50,7 @@ type SingBoxController struct {
 	// Outlives box rebuilds, so traffic counted before a rebuild still gets
 	// reported after it.
 	traffic *singBoxTrafficTracker
+	guard   *singBoxGuard
 
 	// access guards everything below; the node monitor, the traffic monitor
 	// and Close run on different goroutines.
@@ -61,7 +62,11 @@ type SingBoxController struct {
 	// usable user, or after a rebuild failed to start.
 	box      *sb.Box
 	boxNode  *api.NodeInfo
-	boxUsers map[string]string // user tag -> secret
+	boxUsers map[string]string // user name -> secret
+	// credentials gives each uid's secret a version that goes into the
+	// user's name, so a changed secret is a new name: sessions authenticated
+	// with the old secret keep the old name, which the guard stops admitting.
+	credentials map[int]credential
 	// Tag is the running box's inbound tag.
 	Tag string
 	// boxGeneration counts box builds, so tests can tell a rebuild apart.
@@ -104,6 +109,8 @@ func (c *SingBoxController) Start() error {
 		return err
 	}
 	c.traffic = newSingBoxTrafficTracker(c.logger)
+	c.guard = newSingBoxGuard()
+	c.credentials = make(map[int]credential)
 
 	c.access.Lock()
 	c.nodeInfo = newNodeInfo
@@ -214,6 +221,7 @@ func (c *SingBoxController) Close() error {
 func (c *SingBoxController) sync() error {
 	nodeInfo := c.nodeInfo
 	users, secrets, warnings := validUsers(*c.userList)
+	c.trackCredentials(users, secrets)
 	needUsers := nodeNeedsUsers(nodeInfo)
 	if needUsers && len(users) == 0 {
 		// An inbound with no users is never what the panel means: snell
@@ -249,19 +257,26 @@ func (c *SingBoxController) sync() error {
 		return nil
 	}
 	tag := c.Tag
-	wanted := userSecretMap(tag, users, secrets)
+	names := c.userNames(tag, users)
+	wanted := userSecretMap(names, secrets)
 	if maps.Equal(wanted, c.boxUsers) {
 		return nil
 	}
-	err := c.updateInboundUsers(nodeInfo, tag, users, secrets)
+	// Admit the new names before the inbound starts authenticating them, so
+	// their first connection is not turned away.
+	c.guard.admitOnly(slices.Collect(maps.Keys(c.boxUsers)), names)
+	err := c.updateInboundUsers(nodeInfo, tag, names, secrets)
 	if errors.Is(err, errUsersNotReplaceable) {
 		return c.rebuild(nodeInfo, users, secrets)
 	}
 	if err != nil {
 		return err
 	}
-	added, removed, changed := diffUsers(c.boxUsers, wanted)
-	c.logger.Printf("%d user added, %d user deleted, %d user changed", added, removed, changed)
+	// The inbound no longer authenticates the removed users; now cut off
+	// what they still have open.
+	c.guard.admitOnly(names)
+	added, removed := diffUsers(c.boxUsers, wanted)
+	c.logger.Printf("%d user added, %d user deleted", added, removed)
 	c.boxUsers = wanted
 	return nil
 }
@@ -271,18 +286,20 @@ func (c *SingBoxController) sync() error {
 // (say, its port is taken) leaves no box; the next poll tries again.
 func (c *SingBoxController) rebuild(nodeInfo *api.NodeInfo, users []api.UserInfo, secrets []string) error {
 	tag := buildNodeTag(nodeInfo, c.config.ListenIP)
-	newBox, err := c.newBox(nodeInfo, tag, users, secrets)
+	names := c.userNames(tag, users)
+	newBox, err := c.newBox(nodeInfo, tag, names, secrets)
 	if err != nil {
 		return err
 	}
 	c.closeBox()
+	c.guard.admitOnly(names)
 	if err := newBox.Start(); err != nil {
 		_ = newBox.Close()
 		return err
 	}
 	c.box = newBox
 	c.boxNode = nodeInfo
-	c.boxUsers = userSecretMap(tag, users, secrets)
+	c.boxUsers = userSecretMap(names, secrets)
 	c.Tag = tag
 	c.boxGeneration++
 	c.logger.Printf("sing-box node started with %d user(s)", len(users))
@@ -300,21 +317,21 @@ func (c *SingBoxController) closeBox() {
 
 var errUsersNotReplaceable = errors.New("inbound cannot replace users at runtime")
 
-func (c *SingBoxController) updateInboundUsers(nodeInfo *api.NodeInfo, tag string, users []api.UserInfo, secrets []string) error {
+func (c *SingBoxController) updateInboundUsers(nodeInfo *api.NodeInfo, tag string, names, secrets []string) error {
 	inbound, loaded := c.box.Inbound().Get(tag)
 	if !loaded {
 		return fmt.Errorf("inbound %s not found", tag)
 	}
 	switch strings.ToLower(nodeInfo.NodeType) {
 	case "anytls":
-		return replaceUsers(inbound, inboundUsers(tag, users, secrets, anytlsUser))
+		return replaceUsers(inbound, inboundUsers(names, secrets, anytlsUser))
 	case "hysteria":
 		if nodeInfo.HysteriaVersion == 2 {
-			return replaceUsers(inbound, inboundUsers(tag, users, secrets, hysteria2User))
+			return replaceUsers(inbound, inboundUsers(names, secrets, hysteria2User))
 		}
 		return errUsersNotReplaceable
 	case "snell":
-		return replaceUsers(inbound, inboundUsers(tag, users, secrets, snellUser))
+		return replaceUsers(inbound, inboundUsers(names, secrets, snellUser))
 	}
 	return errUsersNotReplaceable
 }
@@ -347,14 +364,46 @@ func buildNodeTag(nodeInfo *api.NodeInfo, listenIP string) string {
 	return fmt.Sprintf("%s_%s_%d", nodeInfo.NodeType, listenIP, nodeInfo.Port)
 }
 
+type credential struct {
+	secret  string
+	version int
+}
+
+// trackCredentials bumps the version of every uid whose secret changed.
+// Versions are kept for removed uids too, so a uid coming back with another
+// secret does not reuse a name an old session may still hold.
+func (c *SingBoxController) trackCredentials(users []api.UserInfo, secrets []string) {
+	for i, user := range users {
+		known, loaded := c.credentials[user.UID]
+		if !loaded {
+			c.credentials[user.UID] = credential{secret: secrets[i]}
+		} else if known.secret != secrets[i] {
+			c.credentials[user.UID] = credential{secret: secrets[i], version: known.version + 1}
+		}
+	}
+}
+
+func (c *SingBoxController) userNames(nodeTag string, users []api.UserInfo) []string {
+	names := make([]string, len(users))
+	for i := range users {
+		names[i] = userTag(nodeTag, &users[i], c.credentials[users[i].UID].version)
+	}
+	return names
+}
+
 // userTag is the user's name inside sing-box, which is what traffic is
-// counted under. parseUserTag reverses it.
-func userTag(nodeTag string, user *api.UserInfo) string {
-	return fmt.Sprintf("%s|%s|%d", nodeTag, user.Email, user.UID)
+// counted under and what the guard admits. parseUserTag reverses it.
+func userTag(nodeTag string, user *api.UserInfo, version int) string {
+	return fmt.Sprintf("%s|%s|%d|%d", nodeTag, user.Email, user.UID, version)
 }
 
 func parseUserTag(name string) (uid int, email string, ok bool) {
 	index := strings.LastIndexByte(name, '|')
+	if index < 0 {
+		return 0, "", false
+	}
+	name = name[:index]
+	index = strings.LastIndexByte(name, '|')
 	if index < 0 {
 		return 0, "", false
 	}
@@ -366,21 +415,18 @@ func parseUserTag(name string) (uid int, email string, ok bool) {
 	return uid, email, ok
 }
 
-func userSecretMap(nodeTag string, users []api.UserInfo, secrets []string) map[string]string {
-	result := make(map[string]string, len(users))
-	for i := range users {
-		result[userTag(nodeTag, &users[i])] = secrets[i]
+func userSecretMap(names, secrets []string) map[string]string {
+	result := make(map[string]string, len(names))
+	for i, name := range names {
+		result[name] = secrets[i]
 	}
 	return result
 }
 
-func diffUsers(old, new map[string]string) (added, removed, changed int) {
-	for name, secret := range new {
-		oldSecret, loaded := old[name]
-		if !loaded {
+func diffUsers(old, new map[string]string) (added, removed int) {
+	for name := range new {
+		if _, loaded := old[name]; !loaded {
 			added++
-		} else if oldSecret != secret {
-			changed++
 		}
 	}
 	for name := range old {
@@ -388,7 +434,7 @@ func diffUsers(old, new map[string]string) (added, removed, changed int) {
 			removed++
 		}
 	}
-	return added, removed, changed
+	return added, removed
 }
 
 // validUsers drops the users the inbound cannot serve correctly and says why.
@@ -439,10 +485,10 @@ func userSecret(user *api.UserInfo) string {
 	return user.UUID
 }
 
-func inboundUsers[U any](nodeTag string, users []api.UserInfo, secrets []string, build func(name, secret string) U) []U {
-	result := make([]U, len(users))
-	for i := range users {
-		result[i] = build(userTag(nodeTag, &users[i]), secrets[i])
+func inboundUsers[U any](names, secrets []string, build func(name, secret string) U) []U {
+	result := make([]U, len(names))
+	for i, name := range names {
+		result[i] = build(name, secrets[i])
 	}
 	return result
 }
@@ -465,7 +511,7 @@ func snellUser(name, secret string) sboption.SnellUser {
 
 // newBox builds a box for the node without starting it, so nothing listens
 // yet.
-func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, users []api.UserInfo, secrets []string) (*sb.Box, error) {
+func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, secrets []string) (*sb.Box, error) {
 	nodeType := strings.ToLower(nodeInfo.NodeType)
 	switch nodeType {
 	case "anytls", "hysteria", "snell":
@@ -520,7 +566,7 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, users []a
 			InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
 				TLS: tlsOptions,
 			},
-			Users: inboundUsers(tag, users, secrets, anytlsUser),
+			Users: inboundUsers(names, secrets, anytlsUser),
 		}
 		if len(nodeInfo.PaddingScheme) > 0 {
 			anytlsOptions.PaddingScheme = badoption.Listable[string](nodeInfo.PaddingScheme)
@@ -547,7 +593,7 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, users []a
 				UpMbps:   nodeInfo.HysteriaUpMbps,
 				DownMbps: nodeInfo.HysteriaDownMbps,
 				Obfs:     obfs,
-				Users:    inboundUsers(tag, users, secrets, hysteria2User),
+				Users:    inboundUsers(names, secrets, hysteria2User),
 			}
 			inboundType = sbc.TypeHysteria2
 			inboundOptions = h2Options
@@ -561,7 +607,7 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, users []a
 				UpMbps:   nodeInfo.HysteriaUpMbps,
 				DownMbps: nodeInfo.HysteriaDownMbps,
 				Obfs:     nodeInfo.HysteriaObfs,
-				Users:    inboundUsers(tag, users, secrets, hysteriaUser),
+				Users:    inboundUsers(names, secrets, hysteriaUser),
 			}
 			inboundType = sbc.TypeHysteria
 			inboundOptions = hOptions
@@ -625,10 +671,10 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, users []a
 			// that admits nobody. sync never builds a box without users; pin
 			// it here too, since getting it wrong admits any psk holder
 			// unmetered.
-			if len(users) == 0 {
+			if len(names) == 0 {
 				return nil, errors.New("snell: multi_user is on but there are zero users — refusing to build: sing-box would fall back to shared-psk mode and admit any psk holder unmetered")
 			}
-			snellOptions.Users = inboundUsers(tag, users, secrets, snellUser)
+			snellOptions.Users = inboundUsers(names, secrets, snellUser)
 		} else {
 			c.logger.Warn("snell: shared-psk mode — all users share the node psk, so no traffic can be attributed and this node will report zero usage to the panel. Set multi_user on the node to meter users (note: official Surge clients cannot connect in that mode).")
 		}
@@ -636,6 +682,9 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, users []a
 		inboundType = sbc.TypeSnell
 		inboundOptions = snellOptions
 	}
+
+	outReg := sboutbound.NewRegistry()
+	registerGuardOutbound(outReg)
 
 	ctx := context.Background()
 	// sing-box's box.New unconditionally configures a default DNS fallback
@@ -647,7 +696,7 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, users []a
 	ctx = sb.Context(
 		ctx,
 		inReg,
-		sboutbound.NewRegistry(),
+		outReg,
 		sbendpoint.NewRegistry(),
 		dnsTransportReg,
 		sbservice.NewRegistry(),
@@ -667,6 +716,15 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, users []a
 					Type:    inboundType,
 					Tag:     tag,
 					Options: inboundOptions,
+				},
+			},
+			// The first outbound is the default one, which every connection
+			// takes.
+			Outbounds: []sboption.Outbound{
+				{
+					Type:    guardOutboundType,
+					Tag:     "direct",
+					Options: &guardOutboundOptions{guard: c.guard},
 				},
 			},
 		},
