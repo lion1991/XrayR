@@ -156,6 +156,30 @@ func (c *SingBoxController) buildUserTag(user *api.UserInfo) string {
 	return fmt.Sprintf("%s|%s|%d", c.Tag, user.Email, user.UID)
 }
 
+// userSecrets returns each user's password, falling back to the UUID. An
+// empty or shared secret fails the node: the inbound cannot tell users with
+// the same secret apart, so one user's traffic would be billed to the other.
+// sing-anytls and sing-quic keep the last of a duplicate without complaint.
+func userSecrets(protocol string, users []api.UserInfo) ([]string, error) {
+	secrets := make([]string, len(users))
+	owners := make(map[string]int, len(users))
+	for i, user := range users {
+		secret := user.Passwd
+		if secret == "" {
+			secret = user.UUID
+		}
+		if secret == "" {
+			return nil, fmt.Errorf("%s user %d has empty password/uuid", protocol, user.UID)
+		}
+		if owner, loaded := owners[secret]; loaded {
+			return nil, fmt.Errorf("%s users %d and %d share the same password/uuid", protocol, owner, user.UID)
+		}
+		owners[secret] = user.UID
+		secrets[i] = secret
+	}
+	return secrets, nil
+}
+
 func (c *SingBoxController) startSingBox() error {
 	nodeType := strings.ToLower(c.nodeInfo.NodeType)
 	switch nodeType {
@@ -206,18 +230,15 @@ func (c *SingBoxController) startSingBox() error {
 	switch nodeType {
 	case "anytls":
 		sbanytls.RegisterInbound(inReg)
+		secrets, err := userSecrets("anytls", *c.userList)
+		if err != nil {
+			return err
+		}
 		users := make([]sboption.AnyTLSUser, 0, len(*c.userList))
-		for _, user := range *c.userList {
-			password := user.Passwd
-			if password == "" {
-				password = user.UUID
-			}
-			if password == "" {
-				return fmt.Errorf("anytls user %d has empty password/uuid", user.UID)
-			}
+		for i, user := range *c.userList {
 			users = append(users, sboption.AnyTLSUser{
 				Name:     c.buildUserTag(&user),
-				Password: password,
+				Password: secrets[i],
 			})
 		}
 		anytlsOptions := &sboption.AnyTLSInboundOptions{
@@ -237,18 +258,15 @@ func (c *SingBoxController) startSingBox() error {
 		version := c.nodeInfo.HysteriaVersion
 		if version == 2 {
 			sbhysteria2.RegisterInbound(inReg)
+			secrets, err := userSecrets("hysteria2", *c.userList)
+			if err != nil {
+				return err
+			}
 			users := make([]sboption.Hysteria2User, 0, len(*c.userList))
-			for _, user := range *c.userList {
-				password := user.Passwd
-				if password == "" {
-					password = user.UUID
-				}
-				if password == "" {
-					return fmt.Errorf("hysteria2 user %d has empty password/uuid", user.UID)
-				}
+			for i, user := range *c.userList {
 				users = append(users, sboption.Hysteria2User{
 					Name:     c.buildUserTag(&user),
-					Password: password,
+					Password: secrets[i],
 				})
 			}
 			var obfs *sboption.Hysteria2Obfs
@@ -272,18 +290,15 @@ func (c *SingBoxController) startSingBox() error {
 			inboundOptions = h2Options
 		} else {
 			sbhysteria.RegisterInbound(inReg)
+			secrets, err := userSecrets("hysteria", *c.userList)
+			if err != nil {
+				return err
+			}
 			users := make([]sboption.HysteriaUser, 0, len(*c.userList))
-			for _, user := range *c.userList {
-				password := user.Passwd
-				if password == "" {
-					password = user.UUID
-				}
-				if password == "" {
-					return fmt.Errorf("hysteria user %d has empty password/uuid", user.UID)
-				}
+			for i, user := range *c.userList {
 				users = append(users, sboption.HysteriaUser{
 					Name:       c.buildUserTag(&user),
-					AuthString: password,
+					AuthString: secrets[i],
 				})
 			}
 			hOptions := &sboption.HysteriaInboundOptions{
@@ -362,18 +377,15 @@ func (c *SingBoxController) startSingBox() error {
 			if len(*c.userList) == 0 {
 				return errors.New("snell: multi_user is on but the panel sent zero users — refusing to boot: sing-box would fall back to shared-psk mode and admit any psk holder unmetered")
 			}
+			secrets, err := userSecrets("snell", *c.userList)
+			if err != nil {
+				return err
+			}
 			users := make([]sboption.SnellUser, 0, len(*c.userList))
-			for _, user := range *c.userList {
-				key := user.Passwd
-				if key == "" {
-					key = user.UUID
-				}
-				if key == "" {
-					return fmt.Errorf("snell user %d has empty password/uuid", user.UID)
-				}
+			for i, user := range *c.userList {
 				users = append(users, sboption.SnellUser{
 					Name:    c.buildUserTag(&user),
-					UserKey: key,
+					UserKey: secrets[i],
 				})
 			}
 			snellOptions.Users = users

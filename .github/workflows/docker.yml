@@ -41,14 +41,32 @@ jobs:
             type=ref,event=tag
             type=raw,value=latest,enable={{is_default_branch}}
 
+      # Read-only deploy key for the private wkernel repository; the Dockerfile
+      # reaches it through the forwarded agent (`ssh: default` below). Loaded right
+      # before the build and dropped after it, so no other step can use it.
+      - name: Load wkernel deploy key
+        env:
+          WKERNEL_DEPLOY_KEY: ${{ secrets.WKERNEL_DEPLOY_KEY }}
+        run: |
+          sock="$RUNNER_TEMP/ssh-agent.sock"
+          eval "$(ssh-agent -a "$sock")" > /dev/null
+          echo "$WKERNEL_DEPLOY_KEY" | ssh-add -
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
+          ssh: default
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Stop ssh agent
+        if: always() && env.SSH_AGENT_PID != ''
+        run: ssh-agent -k

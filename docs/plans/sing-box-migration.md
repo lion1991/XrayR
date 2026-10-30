@@ -49,7 +49,9 @@ Status: 已定，实施中（W1、W2 已完成，下一步 S1）。架构决策�
   - 审计改为匹配 `metadata.Domain`。Xray 匹配的是 `tcp:host:port` 这种字符串，依赖这个格式的面板规则要调整。要拿到域名，节点必须开启路由 sniff（受 `DisableSniffing` 控制）。
   - UDP 的限制：XUDP / packetaddr 一条连接里可以有多个目标，只能按第一个目标做审计。
 - **监听和出站地址**：`ListenIP` 原样传给 sing-box。所有节点目前都没有 IPv6（用户确认），`0.0.0.0` 只监听 IPv4 不影响使用，所以不做 `::` 映射；以后节点加了 IPv6 再改。`SendIP` 是 `0.0.0.0` 时当作没设置。`DNSType` 映射到 `domain_resolver.strategy`，旧的 `domain_strategy` 已废弃。
-- **构建 tag**：Reality 需要 `with_utls`，QUIC 系协议要确认是否需要 `with_quic`，gRPC 按需加 `with_grpc`。不加的话 gRPC 走 lite 实现。S1 把这些 tag 写进 Dockerfile 和验证脚本，e2e 测试也要带上。
+- **构建 tag**（S1 已定）：只加 `with_utls`（Reality 需要），写在 `release/build_tags`，Dockerfile 和 `scripts/verify.sh` 都读这个文件。
+  - 不加 `with_quic`：XrayR 直接注册 hysteria / hysteria2 入站，不经过 sing-box 的 `include` 注册表，`with_quic` 只影响那个注册表、v2ray QUIC 传输和 HTTP/3。
+  - 不加 `with_grpc`：wkernel 客户端的构建也不带，两端都用 lite 实现。
 - **不加内核选择开关**：灰度时把新镜像先部署到一台服务器上，回滚就是重新部署旧镜像。
 - **不做的上报**：keeper 的节点状态上报和违规上报都是空实现，不往 sing-box 侧移植；删除 Xray 时连同 `common/serverstatus` 一起删掉。在线 IP 上报照做。
 
@@ -78,6 +80,18 @@ Status: 已定，实施中（W1、W2 已完成，下一步 S1）。架构决策�
 ### 阶段 1：补齐 sing-box 控制器（AnyTLS / Snell 节点立即受益）
 
 - **S1** 把 XrayR 依赖的 sing-box 换成 wkernel（`replace`），接通 CI 拉取；加上构建 tag。验证：编译，跑 `snell_e2e_test.go` 等现有测试。
+
+  代码已完成，还差推送后在 GitHub Actions 上实测一次。做法：
+  - `replace github.com/sagernet/sing-box => git.wrlog.cn/lion1991/Wkernel.git <tag>`。路径带 `.git` 后缀，Go 直接走 git，不依赖 Forgejo 的 go-get 页面；`https://git.wrlog.cn/` 由 git 的 insteadOf 改写成 `ssh://git@git.wrlog.cn:2222/`。
+  - CI 把 deploy key 装进 ssh-agent，转发给 BuildKit（`RUN --mount=type=ssh`）。主机公钥固定在 `release/known_hosts`。
+  - 依赖下载和编译放在同一个 `RUN` 里，模块缓存用 cache mount：工作流把中间层导出到公开仓库的 Actions 缓存，wkernel 源码不能落进任何一层。
+  - 本机开发：`scripts/verify.sh` 自带 `GOPRIVATE` 和 insteadOf 改写；直接跑 `go` 命令且模块缓存里还没有 wkernel 时，需要自己设这两项。
+  - CI 只在构建前一步把 key 装进 agent，构建完就结束 agent；`.dockerignore` 排除 `.git`，因为 checkout 会把 GITHUB_TOKEN 写进 `.git/config`。
+  - 代价：模块缓存不进层，CI 每次都要重新下载全部模块、从头编译，构建会慢几分钟。接受这个代价。
+  - alpha.3 → alpha.13 没有引起编译错误，但 sing-anytls 升级后去掉了重复密码检查，后写入的会覆盖前一个，两个用户的流量会记到同一个人名下。所以在 controller 里统一做了检查：有空密码或重复密码就拒绝启动节点，和升级前一样。S2 做热更新时再改成跳过有问题的用户并告警。
+  - 推送后还要确认两件事：
+    - GitHub 构建机能连上 `git.wrlog.cn:2222`。本机的验证走了代理，不能证明这一点。
+    - 到服务器上核对 Forgejo 的 SSH 主机公钥指纹，应为 `SHA256:YIMbYkHUTBIZUHcRaOd/FYeBON7Pu0qocBofnSzOOGk`（RSA 4096）。`release/known_hosts` 里的公钥也是经代理取到的。
 - **S2** 用户热更新：定时拉取用户列表，按 UID 区分增删和属性变化，属性变化只更新 limiter。节点信息变化时重建 box。每次拉取时刷新 jitter（现在只在启动时读一次）。调用 `UpdateUsers` 前去重、校验，列表没变就不调（见 W1 的约束）。UUID 或密码变了但名字没变时，按删除再添加处理，并且要断开旧连接，否则旧凭据的会话会以同一个名字继续通过。snell 节点在没有用户时不建入站，等有了用户再重建 box。决定 3 要的断开放到 S3 做，因为需要连接登记表。
 - **S3** 管控：包装出站（设备数、限速、审计）；连接追踪器负责流量计数和连接登记；删除用户时断开现有连接，出站包装还要拒绝不在当前用户列表里的用户（已认证的会话会继续开新流）；在线 IP 按存活连接统计并上报（现在只统计新建连接，长连接用户会漏报）；定时拉取审计规则；自动限速。把 `singbox_traffic.go` 里每条连接一条的 Info 日志降级，UDP 日志里写死的 "AnyTLS" 也改掉。
 - **S4** 出站和日志：`SendIP`、`DNSType`、默认路由 sniff、日志级别和错误日志映射（现在 sing-box 控制器把日志整个关掉了）；默认屏蔽私有 IP 和 BT（决定 2）。BT 识别依赖 sniff。
