@@ -13,16 +13,21 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+type userCounter struct {
+	up   atomic.Int64
+	down atomic.Int64
+}
+
 type singBoxTrafficTracker struct {
-	access   sync.Mutex
-	counters map[string]*atomic.Int64
-	logger   *log.Entry
+	access sync.Mutex
+	users  map[string]*userCounter
+	logger *log.Entry
 }
 
 func newSingBoxTrafficTracker(logger *log.Entry) *singBoxTrafficTracker {
 	return &singBoxTrafficTracker{
-		counters: make(map[string]*atomic.Int64),
-		logger:   logger,
+		users:  make(map[string]*userCounter),
+		logger: logger,
 	}
 }
 
@@ -43,13 +48,8 @@ func (t *singBoxTrafficTracker) RoutedConnection(ctx context.Context, conn net.C
 			"outbound": outboundTag,
 		}).Infof("%s connection", metadata.InboundType)
 	}
-	upName := "user>>>" + user + ">>>traffic>>>uplink"
-	downName := "user>>>" + user + ">>>traffic>>>downlink"
-	t.access.Lock()
-	readCounter := t.loadOrCreateCounter(upName)
-	writeCounter := t.loadOrCreateCounter(downName)
-	t.access.Unlock()
-	return singbufio.NewInt64CounterConn(conn, []*atomic.Int64{readCounter}, []*atomic.Int64{writeCounter})
+	counter := t.counter(user)
+	return singbufio.NewInt64CounterConn(conn, []*atomic.Int64{&counter.up}, []*atomic.Int64{&counter.down})
 }
 
 // RoutedFlow satisfies adapter.ConnectionTracker as of sing-box v1.14. It only
@@ -79,28 +79,29 @@ func (t *singBoxTrafficTracker) RoutedPacketConnection(ctx context.Context, conn
 			"outbound": outboundTag,
 		}).Info("AnyTLS packet connection")
 	}
-	upName := "user>>>" + user + ">>>traffic>>>uplink"
-	downName := "user>>>" + user + ">>>traffic>>>downlink"
-	t.access.Lock()
-	readCounter := t.loadOrCreateCounter(upName)
-	writeCounter := t.loadOrCreateCounter(downName)
-	t.access.Unlock()
-	return singbufio.NewInt64CounterPacketConn(conn, []*atomic.Int64{readCounter}, nil, []*atomic.Int64{writeCounter}, nil)
+	counter := t.counter(user)
+	return singbufio.NewInt64CounterPacketConn(conn, []*atomic.Int64{&counter.up}, nil, []*atomic.Int64{&counter.down}, nil)
 }
 
-func (t *singBoxTrafficTracker) GetCounter(name string) *atomic.Int64 {
+func (t *singBoxTrafficTracker) counter(user string) *userCounter {
 	t.access.Lock()
-	counter := t.counters[name]
-	t.access.Unlock()
-	return counter
-}
-
-func (t *singBoxTrafficTracker) loadOrCreateCounter(name string) *atomic.Int64 {
-	counter, loaded := t.counters[name]
-	if loaded {
-		return counter
+	defer t.access.Unlock()
+	counter, loaded := t.users[user]
+	if !loaded {
+		counter = &userCounter{}
+		t.users[user] = counter
 	}
-	counter = &atomic.Int64{}
-	t.counters[name] = counter
 	return counter
+}
+
+// snapshot returns the counter of every user seen so far. Counters are never
+// dropped: a removed user's connections can still be open and counting.
+func (t *singBoxTrafficTracker) snapshot() map[string]*userCounter {
+	t.access.Lock()
+	defer t.access.Unlock()
+	result := make(map[string]*userCounter, len(t.users))
+	for name, counter := range t.users {
+		result[name] = counter
+	}
+	return result
 }

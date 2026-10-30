@@ -10,6 +10,7 @@ import (
 const (
 	UserNotModified = "users not modified"
 	NodeNotModified = "node not modified"
+	UserListEmpty   = "users is null"
 	RuleNotModified = "rules not modified"
 )
 

@@ -4,12 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
+	"reflect"
+	"slices"
+	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	sb "github.com/sagernet/sing-box"
+	sbadapter "github.com/sagernet/sing-box/adapter"
 	sbcertificate "github.com/sagernet/sing-box/adapter/certificate"
 	sbendpoint "github.com/sagernet/sing-box/adapter/endpoint"
 	sbinbound "github.com/sagernet/sing-box/adapter/inbound"
@@ -34,10 +39,7 @@ type SingBoxController struct {
 	config     *Config
 	clientInfo api.ClientInfo
 	apiClient  api.API
-	nodeInfo   *api.NodeInfo
 
-	Tag       string
-	userList  *[]api.UserInfo
 	tasks     []periodicTask
 	jitter    jitterHolder
 	panelType string
@@ -45,8 +47,31 @@ type SingBoxController struct {
 	startAt time.Time
 	logger  *log.Entry
 
-	box     *sb.Box
+	// Outlives box rebuilds, so traffic counted before a rebuild still gets
+	// reported after it.
 	traffic *singBoxTrafficTracker
+
+	// access guards everything below; the node monitor, the traffic monitor
+	// and Close run on different goroutines.
+	access sync.Mutex
+	// What the panel last sent.
+	nodeInfo *api.NodeInfo
+	userList *[]api.UserInfo
+	// What the running box was built from. box is nil while the node has no
+	// usable user, or after a rebuild failed to start.
+	box      *sb.Box
+	boxNode  *api.NodeInfo
+	boxUsers map[string]string // user tag -> secret
+	// Tag is the running box's inbound tag.
+	Tag string
+	// boxGeneration counts box builds, so tests can tell a rebuild apart.
+	boxGeneration int
+	// closed stops a poll that was already in flight when Close ran from
+	// bringing a box back up.
+	closed bool
+	// lastWarnings holds the user problems last logged, so a poll repeats
+	// them only when they change.
+	lastWarnings []string
 }
 
 func NewSingBoxController(apiClient api.API, config *Config, panelType string) *SingBoxController {
@@ -74,16 +99,17 @@ func (c *SingBoxController) Start() error {
 	if newNodeInfo.Port == 0 {
 		return errors.New("server port must > 0")
 	}
-	c.nodeInfo = newNodeInfo
-	c.Tag = c.buildNodeTag()
-
-	userInfo, err := c.apiClient.GetUserList()
+	userInfo, err := getUserList(c.apiClient)
 	if err != nil {
 		return err
 	}
-	c.userList = userInfo
+	c.traffic = newSingBoxTrafficTracker(c.logger)
 
-	err = c.startSingBox()
+	c.access.Lock()
+	c.nodeInfo = newNodeInfo
+	c.userList = userInfo
+	err = c.sync()
+	c.access.Unlock()
 	if err != nil {
 		return err
 	}
@@ -94,15 +120,14 @@ func (c *SingBoxController) Start() error {
 	}
 
 	// Fold a random delay into each poll/report so the node<->panel cadence
-	// isn't a fixed-period beacon (see withJitter). sing-box nodes don't re-pull
-	// /config, so panel jitter is read once here at start (node-local as
-	// fallback); changing it in the panel takes effect on node restart.
+	// isn't a fixed-period beacon (see withJitter). Refreshed from the panel
+	// on every node info pull.
 	c.jitter.set(effectiveJitter(c.apiClient, c.config.UpdatePeriodicJitter))
 	c.tasks = append(c.tasks, periodicTask{
-		tag: "heartbeat",
+		tag: "node monitor",
 		Periodic: &task.Periodic{
 			Interval: interval,
-			Execute:  withJitter(&c.jitter, c.heartbeatMonitor),
+			Execute:  withJitter(&c.jitter, c.nodeInfoMonitor),
 		},
 	})
 	c.tasks = append(c.tasks, periodicTask{
@@ -121,12 +146,47 @@ func (c *SingBoxController) Start() error {
 	return nil
 }
 
-func (c *SingBoxController) heartbeatMonitor() error {
+// nodeInfoMonitor pulls node info and users from the panel and brings the box
+// in line with them. It also serves as the panel heartbeat. It never returns
+// an error, since that would stop the periodic task for good.
+func (c *SingBoxController) nodeInfoMonitor() error {
 	if time.Since(c.startAt) < time.Duration(c.config.UpdatePeriodic)*time.Second {
 		return nil
 	}
-	_, err := c.apiClient.GetUserList()
-	if err != nil && err.Error() != api.UserNotModified {
+	// keeper answers 304 against an ETag that each successful pull advances,
+	// so whatever a pull returns must be kept even if the other pull fails:
+	// the next one would only say "not modified".
+	newNodeInfo, err := c.apiClient.GetNodeInfo()
+	if err != nil {
+		if err.Error() != api.NodeNotModified {
+			c.logger.Print(err)
+		}
+		newNodeInfo = nil
+	} else if newNodeInfo.Port == 0 {
+		c.logger.Print("server port must > 0")
+		newNodeInfo = nil
+	}
+	newUserInfo, err := getUserList(c.apiClient)
+	if err != nil {
+		if err.Error() != api.UserNotModified {
+			c.logger.Print(err)
+		}
+		newUserInfo = nil
+	}
+	c.jitter.set(effectiveJitter(c.apiClient, c.config.UpdatePeriodicJitter))
+
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.closed {
+		return nil
+	}
+	if newNodeInfo != nil {
+		c.nodeInfo = newNodeInfo
+	}
+	if newUserInfo != nil {
+		c.userList = newUserInfo
+	}
+	if err := c.sync(); err != nil {
 		c.logger.Print(err)
 	}
 	return nil
@@ -141,61 +201,286 @@ func (c *SingBoxController) Close() error {
 		}
 	}
 	c.tasks = nil
-	if c.box != nil {
-		_ = c.box.Close()
-		c.box = nil
-	}
+	c.access.Lock()
+	c.closed = true
+	c.closeBox()
+	c.access.Unlock()
 	return nil
 }
 
-func (c *SingBoxController) buildNodeTag() string {
-	return fmt.Sprintf("%s_%s_%d", c.nodeInfo.NodeType, c.config.ListenIP, c.nodeInfo.Port)
-}
-
-func (c *SingBoxController) buildUserTag(user *api.UserInfo) string {
-	return fmt.Sprintf("%s|%s|%d", c.Tag, user.Email, user.UID)
-}
-
-// userSecrets returns each user's password, falling back to the UUID. An
-// empty or shared secret fails the node: the inbound cannot tell users with
-// the same secret apart, so one user's traffic would be billed to the other.
-// sing-anytls and sing-quic keep the last of a duplicate without complaint.
-func userSecrets(protocol string, users []api.UserInfo) ([]string, error) {
-	secrets := make([]string, len(users))
-	owners := make(map[string]int, len(users))
-	for i, user := range users {
-		secret := user.Passwd
-		if secret == "" {
-			secret = user.UUID
+// sync rebuilds the box when the node info changed (or no box is running),
+// otherwise replaces the inbound's users in place if they changed. A failed
+// sync leaves the desired state in place, so the next poll retries it.
+func (c *SingBoxController) sync() error {
+	nodeInfo := c.nodeInfo
+	users, secrets, warnings := validUsers(*c.userList)
+	needUsers := nodeNeedsUsers(nodeInfo)
+	if needUsers && len(users) == 0 {
+		// An inbound with no users is never what the panel means: snell
+		// would fall back to its shared psk and admit anyone holding it, and
+		// the rest would admit nobody. Serve nothing until a user shows up.
+		if c.box != nil {
+			c.logger.Warn("no usable user left, stopping the inbound until one shows up")
+			c.closeBox()
 		}
-		if secret == "" {
-			return nil, fmt.Errorf("%s user %d has empty password/uuid", protocol, user.UID)
-		}
-		if owner, loaded := owners[secret]; loaded {
-			return nil, fmt.Errorf("%s users %d and %d share the same password/uuid", protocol, owner, user.UID)
-		}
-		owners[secret] = user.UID
-		secrets[i] = secret
+		warnings = append(warnings, "no usable user, the inbound starts once one shows up")
 	}
-	return secrets, nil
+	if !slices.Equal(warnings, c.lastWarnings) {
+		for _, warning := range warnings {
+			c.logger.Warn(warning)
+		}
+		c.lastWarnings = warnings
+	}
+	if needUsers && len(users) == 0 {
+		return nil
+	}
+	if c.box == nil || !reflect.DeepEqual(c.boxNode, nodeInfo) {
+		err := c.rebuild(nodeInfo, users, secrets)
+		if err == nil || c.box == nil {
+			return err
+		}
+		// The new node info was rejected and the old box keeps serving; its
+		// users must still follow the panel until the node info is fixed.
+		c.logger.Print(err)
+		nodeInfo = c.boxNode
+		needUsers = nodeNeedsUsers(nodeInfo)
+	}
+	if !needUsers {
+		return nil
+	}
+	tag := c.Tag
+	wanted := userSecretMap(tag, users, secrets)
+	if maps.Equal(wanted, c.boxUsers) {
+		return nil
+	}
+	err := c.updateInboundUsers(nodeInfo, tag, users, secrets)
+	if errors.Is(err, errUsersNotReplaceable) {
+		return c.rebuild(nodeInfo, users, secrets)
+	}
+	if err != nil {
+		return err
+	}
+	added, removed, changed := diffUsers(c.boxUsers, wanted)
+	c.logger.Printf("%d user added, %d user deleted, %d user changed", added, removed, changed)
+	c.boxUsers = wanted
+	return nil
 }
 
-func (c *SingBoxController) startSingBox() error {
-	nodeType := strings.ToLower(c.nodeInfo.NodeType)
+// rebuild builds the new box before stopping the old one, so a node info
+// sing-box rejects leaves the old box serving. Failing to start the new box
+// (say, its port is taken) leaves no box; the next poll tries again.
+func (c *SingBoxController) rebuild(nodeInfo *api.NodeInfo, users []api.UserInfo, secrets []string) error {
+	tag := buildNodeTag(nodeInfo, c.config.ListenIP)
+	newBox, err := c.newBox(nodeInfo, tag, users, secrets)
+	if err != nil {
+		return err
+	}
+	c.closeBox()
+	if err := newBox.Start(); err != nil {
+		_ = newBox.Close()
+		return err
+	}
+	c.box = newBox
+	c.boxNode = nodeInfo
+	c.boxUsers = userSecretMap(tag, users, secrets)
+	c.Tag = tag
+	c.boxGeneration++
+	c.logger.Printf("sing-box node started with %d user(s)", len(users))
+	return nil
+}
+
+func (c *SingBoxController) closeBox() {
+	if c.box != nil {
+		_ = c.box.Close()
+	}
+	c.box = nil
+	c.boxNode = nil
+	c.boxUsers = nil
+}
+
+var errUsersNotReplaceable = errors.New("inbound cannot replace users at runtime")
+
+func (c *SingBoxController) updateInboundUsers(nodeInfo *api.NodeInfo, tag string, users []api.UserInfo, secrets []string) error {
+	inbound, loaded := c.box.Inbound().Get(tag)
+	if !loaded {
+		return fmt.Errorf("inbound %s not found", tag)
+	}
+	switch strings.ToLower(nodeInfo.NodeType) {
+	case "anytls":
+		return replaceUsers(inbound, inboundUsers(tag, users, secrets, anytlsUser))
+	case "hysteria":
+		if nodeInfo.HysteriaVersion == 2 {
+			return replaceUsers(inbound, inboundUsers(tag, users, secrets, hysteria2User))
+		}
+		return errUsersNotReplaceable
+	case "snell":
+		return replaceUsers(inbound, inboundUsers(tag, users, secrets, snellUser))
+	}
+	return errUsersNotReplaceable
+}
+
+func replaceUsers[U any](inbound sbadapter.Inbound, users []U) error {
+	managed, ok := inbound.(sbadapter.ManagedUserInbound[U])
+	if !ok {
+		return errUsersNotReplaceable
+	}
+	return managed.UpdateUsers(users)
+}
+
+// nodeNeedsUsers is false for a shared-psk snell node, which ignores users.
+func nodeNeedsUsers(nodeInfo *api.NodeInfo) bool {
+	return !strings.EqualFold(nodeInfo.NodeType, "snell") || nodeInfo.SnellMultiUser
+}
+
+// getUserList treats keeper's "users is null" as the empty list it is: the
+// pull already advanced the ETag, so keeping the old list would keep the last
+// removed users admitted for good.
+func getUserList(apiClient api.API) (*[]api.UserInfo, error) {
+	users, err := apiClient.GetUserList()
+	if err != nil && err.Error() == api.UserListEmpty {
+		return &[]api.UserInfo{}, nil
+	}
+	return users, err
+}
+
+func buildNodeTag(nodeInfo *api.NodeInfo, listenIP string) string {
+	return fmt.Sprintf("%s_%s_%d", nodeInfo.NodeType, listenIP, nodeInfo.Port)
+}
+
+// userTag is the user's name inside sing-box, which is what traffic is
+// counted under. parseUserTag reverses it.
+func userTag(nodeTag string, user *api.UserInfo) string {
+	return fmt.Sprintf("%s|%s|%d", nodeTag, user.Email, user.UID)
+}
+
+func parseUserTag(name string) (uid int, email string, ok bool) {
+	index := strings.LastIndexByte(name, '|')
+	if index < 0 {
+		return 0, "", false
+	}
+	uid, err := strconv.Atoi(name[index+1:])
+	if err != nil {
+		return 0, "", false
+	}
+	_, email, ok = strings.Cut(name[:index], "|")
+	return uid, email, ok
+}
+
+func userSecretMap(nodeTag string, users []api.UserInfo, secrets []string) map[string]string {
+	result := make(map[string]string, len(users))
+	for i := range users {
+		result[userTag(nodeTag, &users[i])] = secrets[i]
+	}
+	return result
+}
+
+func diffUsers(old, new map[string]string) (added, removed, changed int) {
+	for name, secret := range new {
+		oldSecret, loaded := old[name]
+		if !loaded {
+			added++
+		} else if oldSecret != secret {
+			changed++
+		}
+	}
+	for name := range old {
+		if _, loaded := new[name]; !loaded {
+			removed++
+		}
+	}
+	return added, removed, changed
+}
+
+// validUsers drops the users the inbound cannot serve correctly and says why.
+// Dropping them keeps one bad entry from failing the whole update, which
+// replaces all users or none.
+//   - The secret is the password, falling back to the UUID; without one the
+//     user cannot authenticate.
+//   - A UID listed twice would give two users the same name.
+//   - Users sharing a secret are indistinguishable to the inbound, so one
+//     would be billed for the other; all of them are dropped. sing-anytls and
+//     sing-quic would silently keep the last one.
+func validUsers(users []api.UserInfo) (valid []api.UserInfo, secrets []string, skipped []string) {
+	seenUIDs := make(map[int]bool, len(users))
+	owners := make(map[string][]int, len(users))
+	candidates := make([]api.UserInfo, 0, len(users))
+	for _, user := range users {
+		if seenUIDs[user.UID] {
+			skipped = append(skipped, fmt.Sprintf("skip user: uid %d is listed more than once", user.UID))
+			continue
+		}
+		seenUIDs[user.UID] = true
+		secret := userSecret(&user)
+		if secret == "" {
+			skipped = append(skipped, fmt.Sprintf("skip user: uid %d has empty password/uuid", user.UID))
+			continue
+		}
+		owners[secret] = append(owners[secret], user.UID)
+		candidates = append(candidates, user)
+	}
+	for _, user := range candidates {
+		secret := userSecret(&user)
+		if uids := owners[secret]; len(uids) > 1 {
+			if uids[0] == user.UID {
+				skipped = append(skipped, fmt.Sprintf("skip users: uids %v share the same password/uuid", uids))
+			}
+			continue
+		}
+		valid = append(valid, user)
+		secrets = append(secrets, secret)
+	}
+	return valid, secrets, skipped
+}
+
+func userSecret(user *api.UserInfo) string {
+	if user.Passwd != "" {
+		return user.Passwd
+	}
+	return user.UUID
+}
+
+func inboundUsers[U any](nodeTag string, users []api.UserInfo, secrets []string, build func(name, secret string) U) []U {
+	result := make([]U, len(users))
+	for i := range users {
+		result[i] = build(userTag(nodeTag, &users[i]), secrets[i])
+	}
+	return result
+}
+
+func anytlsUser(name, secret string) sboption.AnyTLSUser {
+	return sboption.AnyTLSUser{Name: name, Password: secret}
+}
+
+func hysteria2User(name, secret string) sboption.Hysteria2User {
+	return sboption.Hysteria2User{Name: name, Password: secret}
+}
+
+func hysteriaUser(name, secret string) sboption.HysteriaUser {
+	return sboption.HysteriaUser{Name: name, AuthString: secret}
+}
+
+func snellUser(name, secret string) sboption.SnellUser {
+	return sboption.SnellUser{Name: name, UserKey: secret}
+}
+
+// newBox builds a box for the node without starting it, so nothing listens
+// yet.
+func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, users []api.UserInfo, secrets []string) (*sb.Box, error) {
+	nodeType := strings.ToLower(nodeInfo.NodeType)
 	switch nodeType {
 	case "anytls", "hysteria", "snell":
 	default:
-		return fmt.Errorf("unsupported node type for sing-box controller: %s", c.nodeInfo.NodeType)
+		return nil, fmt.Errorf("unsupported node type for sing-box controller: %s", nodeInfo.NodeType)
 	}
-	if c.nodeInfo.Port > 65535 {
-		return fmt.Errorf("invalid listen port: %d", c.nodeInfo.Port)
+	if nodeInfo.Port > 65535 {
+		return nil, fmt.Errorf("invalid listen port: %d", nodeInfo.Port)
 	}
 
 	var listenAddr netip.Addr
 	if c.config.ListenIP != "" {
 		addr, err := netip.ParseAddr(c.config.ListenIP)
 		if err != nil {
-			return fmt.Errorf("invalid listen ip %q: %w", c.config.ListenIP, err)
+			return nil, fmt.Errorf("invalid listen ip %q: %w", c.config.ListenIP, err)
 		}
 		listenAddr = addr
 	} else {
@@ -204,17 +489,17 @@ func (c *SingBoxController) startSingBox() error {
 	listenBadAddr := badoption.Addr(listenAddr)
 	lo := sboption.ListenOptions{
 		Listen:     &listenBadAddr,
-		ListenPort: uint16(c.nodeInfo.Port),
+		ListenPort: uint16(nodeInfo.Port),
 	}
 
 	var tlsOptions *sboption.InboundTLSOptions
-	if c.nodeInfo.EnableTLS {
+	if nodeInfo.EnableTLS {
 		if c.config.CertConfig == nil || c.config.CertConfig.CertMode == "none" {
-			return fmt.Errorf("tls is required but CertConfig is not configured")
+			return nil, fmt.Errorf("tls is required but CertConfig is not configured")
 		}
 		certFile, keyFile, err := getCertFile(c.config.CertConfig)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		tlsOptions = &sboption.InboundTLSOptions{
 			Enabled:         true,
@@ -230,50 +515,28 @@ func (c *SingBoxController) startSingBox() error {
 	switch nodeType {
 	case "anytls":
 		sbanytls.RegisterInbound(inReg)
-		secrets, err := userSecrets("anytls", *c.userList)
-		if err != nil {
-			return err
-		}
-		users := make([]sboption.AnyTLSUser, 0, len(*c.userList))
-		for i, user := range *c.userList {
-			users = append(users, sboption.AnyTLSUser{
-				Name:     c.buildUserTag(&user),
-				Password: secrets[i],
-			})
-		}
 		anytlsOptions := &sboption.AnyTLSInboundOptions{
 			ListenOptions: lo,
 			InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
 				TLS: tlsOptions,
 			},
-			Users: users,
+			Users: inboundUsers(tag, users, secrets, anytlsUser),
 		}
-		if len(c.nodeInfo.PaddingScheme) > 0 {
-			anytlsOptions.PaddingScheme = badoption.Listable[string](c.nodeInfo.PaddingScheme)
+		if len(nodeInfo.PaddingScheme) > 0 {
+			anytlsOptions.PaddingScheme = badoption.Listable[string](nodeInfo.PaddingScheme)
 		}
 		inboundType = sbc.TypeAnyTLS
 		inboundOptions = anytlsOptions
 	case "hysteria":
 		// choose hy1 or hy2 by version, default hy2 when version==2
-		version := c.nodeInfo.HysteriaVersion
+		version := nodeInfo.HysteriaVersion
 		if version == 2 {
 			sbhysteria2.RegisterInbound(inReg)
-			secrets, err := userSecrets("hysteria2", *c.userList)
-			if err != nil {
-				return err
-			}
-			users := make([]sboption.Hysteria2User, 0, len(*c.userList))
-			for i, user := range *c.userList {
-				users = append(users, sboption.Hysteria2User{
-					Name:     c.buildUserTag(&user),
-					Password: secrets[i],
-				})
-			}
 			var obfs *sboption.Hysteria2Obfs
-			if c.nodeInfo.HysteriaObfs != "" {
+			if nodeInfo.HysteriaObfs != "" {
 				obfs = &sboption.Hysteria2Obfs{
-					Type:     c.nodeInfo.HysteriaObfs,
-					Password: c.nodeInfo.HysteriaObfsPassword,
+					Type:     nodeInfo.HysteriaObfs,
+					Password: nodeInfo.HysteriaObfsPassword,
 				}
 			}
 			h2Options := &sboption.Hysteria2InboundOptions{
@@ -281,55 +544,44 @@ func (c *SingBoxController) startSingBox() error {
 				InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
 					TLS: tlsOptions,
 				},
-				UpMbps:   c.nodeInfo.HysteriaUpMbps,
-				DownMbps: c.nodeInfo.HysteriaDownMbps,
+				UpMbps:   nodeInfo.HysteriaUpMbps,
+				DownMbps: nodeInfo.HysteriaDownMbps,
 				Obfs:     obfs,
-				Users:    users,
+				Users:    inboundUsers(tag, users, secrets, hysteria2User),
 			}
 			inboundType = sbc.TypeHysteria2
 			inboundOptions = h2Options
 		} else {
 			sbhysteria.RegisterInbound(inReg)
-			secrets, err := userSecrets("hysteria", *c.userList)
-			if err != nil {
-				return err
-			}
-			users := make([]sboption.HysteriaUser, 0, len(*c.userList))
-			for i, user := range *c.userList {
-				users = append(users, sboption.HysteriaUser{
-					Name:       c.buildUserTag(&user),
-					AuthString: secrets[i],
-				})
-			}
 			hOptions := &sboption.HysteriaInboundOptions{
 				ListenOptions: lo,
 				InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
 					TLS: tlsOptions,
 				},
-				UpMbps:   c.nodeInfo.HysteriaUpMbps,
-				DownMbps: c.nodeInfo.HysteriaDownMbps,
-				Obfs:     c.nodeInfo.HysteriaObfs,
-				Users:    users,
+				UpMbps:   nodeInfo.HysteriaUpMbps,
+				DownMbps: nodeInfo.HysteriaDownMbps,
+				Obfs:     nodeInfo.HysteriaObfs,
+				Users:    inboundUsers(tag, users, secrets, hysteriaUser),
 			}
 			inboundType = sbc.TypeHysteria
 			inboundOptions = hOptions
 		}
 	case "snell":
 		sbsnell.RegisterInbound(inReg)
-		version := c.nodeInfo.SnellVersion
+		version := nodeInfo.SnellVersion
 		// sing-box serves v5 and v6 only — its v4 support is client-side.
 		// Reject here rather than let sing-snell fail deeper in with an error
 		// the operator can't trace back to a panel field.
 		if version != 5 && version != 6 {
-			return fmt.Errorf("snell: unsupported version %d (sing-box serves 5 or 6)", version)
+			return nil, fmt.Errorf("snell: unsupported version %d (sing-box serves 5 or 6)", version)
 		}
-		psk := c.nodeInfo.SnellPSK
+		psk := nodeInfo.SnellPSK
 		if psk == "" {
-			return errors.New("snell: psk is required but the panel sent none")
+			return nil, errors.New("snell: psk is required but the panel sent none")
 		}
 		// Mirrors snell-server v6's own check, which sing-snell reproduces.
 		if version == 6 && (len(psk) < 12 || len(psk) > 255) {
-			return fmt.Errorf("snell: v6 psk must be 12-255 bytes, panel sent %d", len(psk))
+			return nil, fmt.Errorf("snell: v6 psk must be 12-255 bytes, panel sent %d", len(psk))
 		}
 
 		snellOptions := &sboption.SnellInboundOptions{
@@ -340,9 +592,9 @@ func (c *SingBoxController) startSingBox() error {
 			},
 		}
 		if version == 6 {
-			snellOptions.V6Options = sboption.SnellV6Options{Mode: c.nodeInfo.SnellMode}
+			snellOptions.V6Options = sboption.SnellV6Options{Mode: nodeInfo.SnellMode}
 		} else {
-			snellOptions.ObfsOptions = sboption.SnellObfsServerOptions{ObfsMode: c.nodeInfo.SnellObfs}
+			snellOptions.ObfsOptions = sboption.SnellObfsServerOptions{ObfsMode: nodeInfo.SnellObfs}
 		}
 
 		// The two user models are mutually exclusive, and the choice is the
@@ -359,36 +611,24 @@ func (c *SingBoxController) startSingBox() error {
 		//     option for a client id: it sends an empty one and sing-snell
 		//     turns that into ErrBadUserKey, so official Surge clients cannot
 		//     connect to a node in this mode. Only sing-box-family clients can.
-		if c.nodeInfo.SnellMultiUser {
+		if nodeInfo.SnellMultiUser {
 			// v5 + multi_user is a node no client can reach, so refuse to boot
 			// one rather than let it sit there looking healthy: official Surge
 			// speaks v5 but cannot send a client-id, and the only clients that
 			// can send one are sing-box-family — which implement no v5 client
 			// at all (sing-snell ships snellv5/server.go with no client.go).
 			if version == 5 {
-				return errors.New("snell: version 5 with multi_user has no reachable client — Surge cannot send a client-id and sing-box has no v5 client. Use version 6, or turn multi_user off")
+				return nil, errors.New("snell: version 5 with multi_user has no reachable client — Surge cannot send a client-id and sing-box has no v5 client. Use version 6, or turn multi_user off")
 			}
 			// sing-box picks the service implementation off len(Users): an
 			// empty list builds the SHARED-PSK service, not a multi-user one
-			// that admits nobody. Booting here would silently invert the
-			// operator's intent — any psk holder connects, nobody is metered.
-			// keeper's GetUserList already errors on an empty list ("users is
-			// null"), but that invariant lives a repo away; pin it locally.
-			if len(*c.userList) == 0 {
-				return errors.New("snell: multi_user is on but the panel sent zero users — refusing to boot: sing-box would fall back to shared-psk mode and admit any psk holder unmetered")
+			// that admits nobody. sync never builds a box without users; pin
+			// it here too, since getting it wrong admits any psk holder
+			// unmetered.
+			if len(users) == 0 {
+				return nil, errors.New("snell: multi_user is on but there are zero users — refusing to build: sing-box would fall back to shared-psk mode and admit any psk holder unmetered")
 			}
-			secrets, err := userSecrets("snell", *c.userList)
-			if err != nil {
-				return err
-			}
-			users := make([]sboption.SnellUser, 0, len(*c.userList))
-			for i, user := range *c.userList {
-				users = append(users, sboption.SnellUser{
-					Name:    c.buildUserTag(&user),
-					UserKey: secrets[i],
-				})
-			}
-			snellOptions.Users = users
+			snellOptions.Users = inboundUsers(tag, users, secrets, snellUser)
 		} else {
 			c.logger.Warn("snell: shared-psk mode — all users share the node psk, so no traffic can be attributed and this node will report zero usage to the panel. Set multi_user on the node to meter users (note: official Surge clients cannot connect in that mode).")
 		}
@@ -417,7 +657,6 @@ func (c *SingBoxController) startSingBox() error {
 		sbcertificate.NewRegistry(),
 	)
 
-	traffic := newSingBoxTrafficTracker(c.logger)
 	options := sb.Options{
 		Options: sboption.Options{
 			Log: &sboption.LogOptions{
@@ -426,7 +665,7 @@ func (c *SingBoxController) startSingBox() error {
 			Inbounds: []sboption.Inbound{
 				{
 					Type:    inboundType,
-					Tag:     c.Tag,
+					Tag:     tag,
 					Options: inboundOptions,
 				},
 			},
@@ -436,91 +675,72 @@ func (c *SingBoxController) startSingBox() error {
 
 	boxInstance, err := sb.New(options)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	boxInstance.Router().AppendTracker(traffic)
-	if err := boxInstance.Start(); err != nil {
-		_ = boxInstance.Close()
-		return err
-	}
-	c.box = boxInstance
-	c.traffic = traffic
-	return nil
+	boxInstance.Router().AppendTracker(c.traffic)
+	return boxInstance, nil
 }
 
-func (c *SingBoxController) getTraffic(userTag string) (up int64, down int64, upCounter *atomic.Int64, downCounter *atomic.Int64) {
-	upName := "user>>>" + userTag + ">>>traffic>>>uplink"
-	downName := "user>>>" + userTag + ">>>traffic>>>downlink"
-	upCounter = c.traffic.GetCounter(upName)
-	downCounter = c.traffic.GetCounter(downName)
-	if upCounter != nil && upCounter.Load() != 0 {
-		up = upCounter.Load()
-	} else {
-		upCounter = nil
-	}
-	if downCounter != nil && downCounter.Load() != 0 {
-		down = downCounter.Load()
-	} else {
-		downCounter = nil
-	}
-	return up, down, upCounter, downCounter
-}
-
-func (c *SingBoxController) resetTraffic(upCounterList *[]*atomic.Int64, downCounterList *[]*atomic.Int64) {
-	for _, upCounter := range *upCounterList {
-		upCounter.Store(0)
-	}
-	for _, downCounter := range *downCounterList {
-		downCounter.Store(0)
-	}
-}
-
-func (c *SingBoxController) trafficMonitor() (err error) {
+// trafficMonitor reports every counter with traffic on it, including users
+// removed since the last report and names from before a rebuild, so their
+// last stretch of traffic is not lost.
+func (c *SingBoxController) trafficMonitor() error {
 	if time.Since(c.startAt) < time.Duration(c.config.UpdatePeriodic)*time.Second {
 		return nil
 	}
-	if c.traffic == nil || c.userList == nil {
-		return nil
+	type pending struct {
+		counter  *userCounter
+		up, down int64
 	}
-
+	// keeper keys a report by uid, so one uid counted under two names (a
+	// rebuild moved the node tag, or the email changed) must be merged or
+	// one of them would be dropped.
+	byUID := make(map[int]int)
 	var userTraffic []api.UserTraffic
-	var upCounterList []*atomic.Int64
-	var downCounterList []*atomic.Int64
-
-	for _, user := range *c.userList {
-		userTag := c.buildUserTag(&user)
-		up, down, upCounter, downCounter := c.getTraffic(userTag)
-		if down > 0 {
-			c.logger.Printf("Traffic counted: tag=%s up=%d down=%d", userTag, up, down)
+	var reported []pending
+	for name, counter := range c.traffic.snapshot() {
+		up, down := counter.up.Load(), counter.down.Load()
+		if up == 0 && down == 0 {
+			continue
 		}
-		if up > 0 || down > 0 {
+		uid, email, ok := parseUserTag(name)
+		if !ok {
+			c.logger.Warnf("drop traffic of unrecognized user %q", name)
+			counter.up.Add(-up)
+			counter.down.Add(-down)
+			continue
+		}
+		if down > 0 {
+			c.logger.Printf("Traffic counted: tag=%s up=%d down=%d", name, up, down)
+		}
+		if index, loaded := byUID[uid]; loaded {
+			userTraffic[index].Upload += up
+			userTraffic[index].Download += down
+		} else {
+			byUID[uid] = len(userTraffic)
 			userTraffic = append(userTraffic, api.UserTraffic{
-				UID:      user.UID,
-				Email:    user.Email,
+				UID:      uid,
+				Email:    email,
 				Upload:   up,
 				Download: down,
 			})
-			if upCounter != nil {
-				upCounterList = append(upCounterList, upCounter)
-			}
-			if downCounter != nil {
-				downCounterList = append(downCounterList, downCounter)
-			}
 		}
+		reported = append(reported, pending{counter, up, down})
 	}
 
 	if len(userTraffic) > 0 {
 		c.logger.Printf("Reporting %d user(s) traffic to panel; example: UID=%d up=%d down=%d", len(userTraffic), userTraffic[0].UID, userTraffic[0].Upload, userTraffic[0].Download)
-		var reportErr error
 		if !c.config.DisableUploadTraffic {
-			reportErr = c.apiClient.ReportUserTraffic(&userTraffic)
+			if err := c.apiClient.ReportUserTraffic(&userTraffic); err != nil {
+				c.logger.Print(err)
+				return nil
+			}
 		}
-		if reportErr != nil {
-			c.logger.Print(reportErr)
-		} else {
-			c.resetTraffic(&upCounterList, &downCounterList)
+		// Subtract rather than zero: connections keep counting meanwhile.
+		for _, p := range reported {
+			p.counter.up.Add(-p.up)
+			p.counter.down.Add(-p.down)
 		}
 	}
-
 	return nil
 }

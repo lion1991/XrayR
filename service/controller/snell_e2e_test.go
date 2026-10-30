@@ -2,6 +2,7 @@ package controller_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -35,23 +36,58 @@ type fakeSnellAPI struct {
 
 	mu       sync.Mutex
 	reported []api.UserTraffic
+	// keeper keys a report by uid, so a repeated uid loses traffic there.
+	repeatedUID bool
 }
 
-func (f *fakeSnellAPI) GetNodeInfo() (*api.NodeInfo, error) { return f.nodeInfo, nil }
+func (f *fakeSnellAPI) GetNodeInfo() (*api.NodeInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nodeInfo, nil
+}
 
 func (f *fakeSnellAPI) GetUserList() (*[]api.UserInfo, error) {
-	users := f.users
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.users) == 0 {
+		return nil, errors.New(api.UserListEmpty) // what keeper answers
+	}
+	users := append([]api.UserInfo(nil), f.users...)
 	return &users, nil
+}
+
+// setNodeInfo hands out a changed copy, as a real panel decodes a fresh one.
+func (f *fakeSnellAPI) setNodeInfo(change func(*api.NodeInfo)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	nodeInfo := *f.nodeInfo
+	change(&nodeInfo)
+	f.nodeInfo = &nodeInfo
+}
+
+func (f *fakeSnellAPI) setUsers(users []api.UserInfo) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.users = users
 }
 
 func (f *fakeSnellAPI) ReportUserTraffic(traffic *[]api.UserTraffic) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	seen := make(map[int]bool)
+	for _, t := range *traffic {
+		if seen[t.UID] {
+			f.repeatedUID = true
+		}
+		seen[t.UID] = true
+	}
 	f.reported = append(f.reported, *traffic...)
 	return nil
 }
 
 func (f *fakeSnellAPI) Describe() api.ClientInfo {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return api.ClientInfo{APIHost: "fake", NodeID: 1, NodeType: f.nodeInfo.NodeType}
 }
 
@@ -370,14 +406,14 @@ func TestSnellV5MultiUserIsRefused(t *testing.T) {
 	t.Logf("OK: refused to boot an unreachable v5 multi_user node: %v", err)
 }
 
-// A multi_user node with zero users must refuse to boot: sing-box picks the
-// service implementation off len(Users), so an empty list silently builds the
-// SHARED-PSK service — any psk holder connects and nobody is metered, the
-// exact inverse of what the operator asked for. keeper cannot normally produce
-// this (its GetUserList errors on an empty list), so this pins the invariant
-// locally against that ever being relaxed.
-func TestSnellV6MultiUserWithZeroUsersIsRefused(t *testing.T) {
+// A multi_user node with zero users must not serve: sing-box picks the
+// service implementation off len(Users), so an empty list would build the
+// SHARED-PSK service — any psk holder connects and nobody is metered. The
+// controller starts without an inbound and builds it once a user shows up.
+func TestSnellV6MultiUserWithZeroUsersWaitsForUsers(t *testing.T) {
+	echo := startEchoServer(t)
 	port := freePort(t)
+	nodeAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	f := &fakeSnellAPI{
 		nodeInfo: &api.NodeInfo{
 			NodeType:       "Snell",
@@ -391,10 +427,21 @@ func TestSnellV6MultiUserWithZeroUsersIsRefused(t *testing.T) {
 	}
 
 	c := NewSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1}, "Keeper")
-	err := c.Start()
-	if err == nil {
-		_ = c.Close()
-		t.Fatal("a multi_user Snell node with zero users started — it would be running in shared-psk mode against the operator's explicit intent")
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start with zero users: %v", err)
 	}
-	t.Logf("OK: refused to boot a zero-user multi_user node: %v", err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	if conn, err := snellDial(t, nodeAddr, "", echo); err == nil {
+		_, err = echoThrough(conn, "hello-psk")
+		_ = conn.Close()
+		if err == nil {
+			t.Fatal("a multi_user node with zero users served a psk-only client: it fell back to shared-psk mode")
+		}
+	}
+
+	f.setUsers([]api.UserInfo{{UID: 42, UUID: snellTestUUID, Email: "a@test"}})
+	waitFor(t, "the inbound to start once a user shows up", func() bool {
+		return proxies(t, nodeAddr, snellTestUUID, echo)
+	})
 }

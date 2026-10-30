@@ -257,7 +257,7 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	b, _ := usersResp.Get("users").Encode()
 	json.Unmarshal(b, &users)
 	if len(users) == 0 {
-		return nil, errors.New("users is null")
+		return nil, errors.New(api.UserListEmpty)
 	}
 
 	userList := make([]api.UserInfo, len(users))
