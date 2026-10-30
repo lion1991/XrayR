@@ -26,7 +26,6 @@ import (
 	sblocaldns "github.com/sagernet/sing-box/dns/transport/local"
 	sboption "github.com/sagernet/sing-box/option"
 	sbanytls "github.com/sagernet/sing-box/protocol/anytls"
-	sbhysteria "github.com/sagernet/sing-box/protocol/hysteria"
 	sbhysteria2 "github.com/sagernet/sing-box/protocol/hysteria2"
 	sbshadowsocks "github.com/sagernet/sing-box/protocol/shadowsocks"
 	sbsnell "github.com/sagernet/sing-box/protocol/snell"
@@ -380,10 +379,7 @@ func (c *SingBoxController) updateInboundUsers(nodeInfo *api.NodeInfo, tag strin
 	case "anytls":
 		return replaceUsers(inbound, inboundUsers(names, secrets, anytlsUser))
 	case "hysteria":
-		if nodeInfo.HysteriaVersion == 2 {
-			return replaceUsers(inbound, inboundUsers(names, secrets, hysteria2User))
-		}
-		return errUsersNotReplaceable
+		return replaceUsers(inbound, inboundUsers(names, secrets, hysteria2User))
 	case "snell":
 		return replaceUsers(inbound, inboundUsers(names, secrets, snellUser))
 	case "trojan":
@@ -609,10 +605,6 @@ func hysteria2User(name, secret string) sboption.Hysteria2User {
 	return sboption.Hysteria2User{Name: name, Password: secret}
 }
 
-func hysteriaUser(name, secret string) sboption.HysteriaUser {
-	return sboption.HysteriaUser{Name: name, AuthString: secret}
-}
-
 func trojanUser(name, secret string) sboption.TrojanUser {
 	return sboption.TrojanUser{Name: name, Password: secret}
 }
@@ -697,43 +689,29 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 		inboundType = sbc.TypeAnyTLS
 		inboundOptions = anytlsOptions
 	case "hysteria":
-		// choose hy1 or hy2 by version, default hy2 when version==2
-		version := nodeInfo.HysteriaVersion
-		if version == 2 {
-			sbhysteria2.RegisterInbound(inReg)
-			var obfs *sboption.Hysteria2Obfs
-			if nodeInfo.HysteriaObfs != "" {
-				obfs = &sboption.Hysteria2Obfs{
-					Type:     nodeInfo.HysteriaObfs,
-					Password: nodeInfo.HysteriaObfsPassword,
-				}
+		// Xray served Hysteria 2 only; this sing-box code used to start
+		// Hysteria 1 for any other version, version 0 included.
+		if nodeInfo.HysteriaVersion != 2 {
+			return nil, fmt.Errorf("hysteria: only Hysteria 2 is supported, node has version %d", nodeInfo.HysteriaVersion)
+		}
+		sbhysteria2.RegisterInbound(inReg)
+		var obfs *sboption.Hysteria2Obfs
+		if nodeInfo.HysteriaObfs != "" {
+			obfs = &sboption.Hysteria2Obfs{
+				Type:     nodeInfo.HysteriaObfs,
+				Password: nodeInfo.HysteriaObfsPassword,
 			}
-			h2Options := &sboption.Hysteria2InboundOptions{
-				ListenOptions: lo,
-				InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
-					TLS: tlsOptions,
-				},
-				UpMbps:   nodeInfo.HysteriaUpMbps,
-				DownMbps: nodeInfo.HysteriaDownMbps,
-				Obfs:     obfs,
-				Users:    inboundUsers(names, secrets, hysteria2User),
-			}
-			inboundType = sbc.TypeHysteria2
-			inboundOptions = h2Options
-		} else {
-			sbhysteria.RegisterInbound(inReg)
-			hOptions := &sboption.HysteriaInboundOptions{
-				ListenOptions: lo,
-				InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
-					TLS: tlsOptions,
-				},
-				UpMbps:   nodeInfo.HysteriaUpMbps,
-				DownMbps: nodeInfo.HysteriaDownMbps,
-				Obfs:     nodeInfo.HysteriaObfs,
-				Users:    inboundUsers(names, secrets, hysteriaUser),
-			}
-			inboundType = sbc.TypeHysteria
-			inboundOptions = hOptions
+		}
+		inboundType = sbc.TypeHysteria2
+		inboundOptions = &sboption.Hysteria2InboundOptions{
+			ListenOptions: lo,
+			InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
+				TLS: tlsOptions,
+			},
+			UpMbps:   nodeInfo.HysteriaUpMbps,
+			DownMbps: nodeInfo.HysteriaDownMbps,
+			Obfs:     obfs,
+			Users:    inboundUsers(names, secrets, hysteria2User),
 		}
 	case "trojan":
 		// keeper serves Trojan over plain TCP only; other transports land

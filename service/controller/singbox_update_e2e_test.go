@@ -429,6 +429,9 @@ func TestSingBoxNodeAutoLimitsFastUsers(t *testing.T) {
 // A node keeps users off the server's own and its network's addresses, by IP
 // or by a domain that leads there, over TCP and UDP, and off BitTorrent.
 func TestSingBoxNodeBlocksPrivateAndBitTorrent(t *testing.T) {
+	if raceEnabled {
+		t.Skip("sing-snell races CloseWrite against FrontHeadroom (docs/plans/sing-box-migration.md)")
+	}
 	echo := startEchoServer(t)
 	_, echoPort, _ := net.SplitHostPort(echo)
 	udpEcho := startUDPEchoServer(t)

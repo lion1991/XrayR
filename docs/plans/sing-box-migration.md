@@ -1,6 +1,6 @@
 # 主内核从 Xray-core 迁到 sing-box（wkernel）
 
-Status: 已定，实施中（W1、W2、S1–S4、P1、P2 已完成，下一步 P3）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
+Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，下一步 P4）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
 
 ## 背景与目标
 
@@ -176,6 +176,16 @@ Status: 已定，实施中（W1、W2、S1–S4、P1、P2 已完成，下一步 P
   - 启动报错、不降级：面板配了 obfs（keeper 把它放在 `Header` 里）；`2022-blake3-chacha20-poly1305`（sing-shadowsocks 没有它的多用户模式）；`none` 和流加密由 sing-box 自己拒绝。
   - 新 node info 被拒、旧 box 继续服务时，用户密钥按旧 box 的加密方式派生；用户名里的凭据版本按面板原始密码跟踪、不按派生后的密钥，否则改错加密方式和改回去都会各断一次所有在线连接（`TestShadowsocksRejectedMethodChangeKeepsOldKeys`）。遗留（keeper 的密码都是 36 位 UUID，碰不到）：被拒的新配置仍然决定限速、设备数用哪组用户，以及"没有可用用户就停入站"的判断；新方法下全部用户都无效（比如密码都不够 16 / 32 字节）时，旧 box 也会被停掉。
   - 依赖版本被压低：XrayR 自己直接 require 的 sing-shadowsocks `v0.2.9` 是 2025-09 的旧正式版，semver 上却高于 wkernel 要求的 2026-09 伪版本 `v0.2.9-0.20260929204512-65740e0f0e3e`，所以 MVS 选了旧版。旧版多用户服务改用户表不加锁，热更新撞上新连接就 panic。现在 require 改成 wkernel 的版本，回归用例 `TestShadowsocksUserUpdatesWhileConnecting` 在旧版下不开 race 也必崩。
+- **P3** Hysteria2（已完成）：只服务 Hysteria 2，version 不是 2 时启动报错（和 Xray 一致）；旧 sing-box 代码的 Hysteria 1 分支已删。
+  - 用户密钥用密码（没有就用 UUID），和 Xray 一致；用户变化热更新不重建。
+  - obfs（keeper 只发 salamander）、带宽直接映射到 sing-box 的 `obfs` / `up_mbps` / `down_mbps`；不认识的 obfs 类型由 sing-box 拒绝启动。ALPN 由 sing-quic 默认协商 `h3`，和 Xray 显式设置的一致。
+  - 证书续期后重建 box（P1 已做）。
+  - 和 Xray 的带宽差异（照"沿用旧 sing-box 实现"做，是否改回待用户决定）：
+    - 服务端上行为 0（keeper 没填）时，Xray 一律用 BBR；sing-quic 只要客户端声明了下行带宽就用 Brutal，而且不封顶，客户端自己填多大就发多快。
+    - 只填了上行、下行为 0 时，Xray 回 `CC-RX: 0`，客户端上传用自己的 Brutal；sing-quic 回 `auto`，客户端改用 BBR。
+    - 单位：Xray 的 "N mbps" 是 N×1024×1024/8 B/s，sing-box 是 N×125000 B/s，同一个面板值低约 4.6%。
+    - 改回 Xray 的语义要动 wkernel（或 sing-quic）。
+  - 上线后 sing-quic 用户表的数据竞争（见风险）进入生产：amd64 实际不出错，上 arm64 前必须修。
 
 每步都要验证：e2e 测试通过；灰度服务器的流量上报、在线 IP、限速和 Xray 时期一致；CPU 和吞吐不明显变差。
 
@@ -198,8 +208,8 @@ Status: 已定，实施中（W1、W2、S1–S4、P1、P2 已完成，下一步 P
 - wkernel 跟随上游 alpha，内部 API 经常变（v1.14 起就遇到过证书注册表变化）。服务端补丁会增加每次同步的冲突面。缓解办法：补丁尽量集中在一个接口上，同步验收清单里加上服务端 e2e 测试。
 - Reality 和 Vision 两端实现不同（Xray 和 sing-box），P5 是迁移后才首次由 wkernel 同源服务。要先在自己的设备上长时间使用，再全量。
 - ~~S3 实测：限速包装会不会被 splice / 零拷贝绕过。~~ S3b 已核对，不会（见 S3b）。
-- hysteria2 的热更新依赖 sing-quic 的 `UpdateUsers`，它发布用户表时没有同步，是数据竞争。现在镜像只构建 amd64，实际不会出错。上 arm64 之前，必须先在 sing-quic 里改成原子存储。
-- sing-snell v6 的数据竞争（上游，S4 的测试暴露）：连接在服务端第一次回复前关闭时，`CloseWrite` 在锁内写 `session.writer`，另一个拷贝方向的 `FrontHeadroom` 不加锁读它。远端没回包就断开的 Snell UDP / UoT 连接都会碰到，`TestSingBoxNodeBlocksPrivateAndBitTorrent` 在 `-race` 下基本每次都会报出，跑 race 时先 `-skip` 它。根治要在 sing-snell 里给 `FrontHeadroom` 加锁或改成原子读。
+- hysteria2 的热更新依赖 sing-quic 的 `UpdateUsers`，它发布用户表时没有同步，是数据竞争。现在镜像只构建 amd64，实际不会出错。上 arm64 之前，必须先在 sing-quic 里改成原子存储。`TestHysteria2NodeReplacesUsers` 在 race 构建下自动跳过。
+- sing-snell v6 的数据竞争（上游，S4 的测试暴露）：连接在服务端第一次回复前关闭时，`CloseWrite` 在锁内写 `session.writer`，另一个拷贝方向的 `FrontHeadroom` 不加锁读它。远端没回包就断开的 Snell UDP / UoT 连接都会碰到，`TestSingBoxNodeBlocksPrivateAndBitTorrent` 在 `-race` 下基本每次都会报出，race 构建下自动跳过（`raceEnabled`）。根治要在 sing-snell 里给 `FrontHeadroom` 加锁或改成原子读。
 - 升级 wkernel 时，要核对 XrayR 实际选中的依赖版本和 wkernel 的 go.mod 一致（对比两边的 `go list -m all`）。XrayR 自己的 require 会把 wkernel 要求的版本换掉，伪版本对正式版时，选中的可能反而是更旧的代码（P2 的 sing-shadowsocks 就是这样）。
 - sing-shadowsocks 的数据竞争（上游）：SS2022 服务端连接用无锁的双重检查读 `c.writer`，客户端在服务端第一次回包前断开时，`Close` 和首次写并发，`-race` 会报。被竞争的是一个指针，最坏情况只是 `Close` 漏关 writer，底层连接照样会关。上游 sing-box 的每个 SS2022 入站都有这个问题，不 fork 修，测试里先等回显再关连接来避开。
 - 热更新会重建 snell 服务，两个副作用：

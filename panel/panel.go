@@ -208,7 +208,7 @@ func (p *Panel) Start() {
 		// Protocols move to sing-box one by one (docs/plans/sing-box-migration.md);
 		// the rest still run on Xray.
 		if strings.EqualFold(nodeType, "AnyTLS") || strings.EqualFold(nodeType, "Snell") || strings.EqualFold(nodeType, "Trojan") ||
-			strings.EqualFold(nodeType, "Shadowsocks") {
+			strings.EqualFold(nodeType, "Shadowsocks") || strings.EqualFold(nodeType, "Hysteria") {
 			logConfig := p.logConfig()
 			controllerService = controller.NewSingBoxController(apiClient, controllerConfig, nodeConfig.PanelType,
 				controller.SingBoxLog{Level: logConfig.Level, Path: logConfig.ErrorPath})
