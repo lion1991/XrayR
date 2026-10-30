@@ -19,6 +19,7 @@ import (
 	sblog "github.com/sagernet/sing-box/log"
 	sboption "github.com/sagernet/sing-box/option"
 	sbdirect "github.com/sagernet/sing-box/protocol/direct"
+	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
@@ -33,6 +34,7 @@ import (
 var (
 	errUserNotServed = errors.New("user is no longer served by this node")
 	errDeviceLimit   = errors.New("user reached the device limit")
+	errPrivateTarget = errors.New("destination is a private address")
 	errAuditRule     = errors.New("destination is rejected by an audit rule")
 )
 
@@ -416,7 +418,9 @@ func setBucketRate(bucket *rate.Limiter, limit uint64) {
 const guardOutboundType = "xrayr-direct"
 
 type guardOutboundOptions struct {
-	guard *singBoxGuard
+	guard        *singBoxGuard
+	direct       sboption.DirectOutboundOptions
+	blockPrivate bool
 }
 
 func registerGuardOutbound(registry *sboutbound.Registry) {
@@ -428,23 +432,31 @@ func registerGuardOutbound(registry *sboutbound.Registry) {
 // interface the router and the connection manager look for on it.
 type guardOutbound struct {
 	*sbdirect.Outbound
-	guard      *singBoxGuard
-	connection sbadapter.ConnectionManager
+	guard        *singBoxGuard
+	blockPrivate bool
+	dns          sbadapter.DNSRouter
+	connection   sbadapter.ConnectionManager
 }
 
 func newGuardOutbound(ctx context.Context, router sbadapter.Router, logger sblog.ContextLogger, tag string, options guardOutboundOptions) (sbadapter.Outbound, error) {
-	outbound, err := sbdirect.NewOutbound(ctx, router, logger, tag, sboption.DirectOutboundOptions{})
+	outbound, err := sbdirect.NewOutbound(ctx, router, logger, tag, options.direct)
 	if err != nil {
 		return nil, err
 	}
 	return &guardOutbound{
-		Outbound:   outbound.(*sbdirect.Outbound),
-		guard:      options.guard,
-		connection: service.FromContext[sbadapter.ConnectionManager](ctx),
+		Outbound:     outbound.(*sbdirect.Outbound),
+		guard:        options.guard,
+		blockPrivate: options.blockPrivate,
+		dns:          service.FromContext[sbadapter.DNSRouter](ctx),
+		connection:   service.FromContext[sbadapter.ConnectionManager](ctx),
 	}, nil
 }
 
 func (h *guardOutbound) NewConnection(ctx context.Context, conn net.Conn, metadata sbadapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if err := h.checkTarget(&metadata); err != nil {
+		N.CloseOnHandshakeFailure(conn, onClose, err)
+		return
+	}
 	if err := h.checkAudit(&metadata); err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		return
@@ -463,6 +475,14 @@ func (h *guardOutbound) NewConnection(ctx context.Context, conn net.Conn, metada
 // NewPacketConnection audits the first destination only: a packet connection
 // (XUDP, packetaddr) may later send to others.
 func (h *guardOutbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata sbadapter.InboundContext, onClose N.CloseHandlerFunc) {
+	// Legacy UoT routes with an unspecified destination, which is no
+	// address at all; publicPacketConn checks where each packet goes.
+	if !metadata.Destination.IsIP() || !metadata.Destination.Addr.IsUnspecified() {
+		if err := h.checkTarget(&metadata); err != nil {
+			N.CloseOnHandshakeFailure(conn, onClose, err)
+			return
+		}
+	}
 	if err := h.checkAudit(&metadata); err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		return
@@ -472,10 +492,108 @@ func (h *guardOutbound) NewPacketConnection(ctx context.Context, conn N.PacketCo
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		return
 	}
+	if h.blockPrivate {
+		conn = &publicPacketConn{PacketConn: conn, ctx: ctx, dns: h.dns}
+	}
 	if bucket != nil {
 		conn = &ratePacketConn{PacketConn: conn, bucket: bucket}
 	}
 	h.connection.NewPacketConnection(ctx, h.Outbound, conn, metadata, releaseOnClose(release, onClose))
+}
+
+// publicPacketConn drops the client's packets to private addresses: the
+// guard checks only the first destination of a packet connection, which may
+// send to others later (XUDP, UoT). A domain is looked up first, so it has
+// to lead to public addresses only; direct looks it up again, which a DNS
+// answer that changes in between slips past.
+type publicPacketConn struct {
+	N.PacketConn
+	ctx context.Context
+	dns sbadapter.DNSRouter
+}
+
+func (c *publicPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	start := buffer.Start()
+	for {
+		destination, err := c.PacketConn.ReadPacket(buffer)
+		if err != nil || c.public(destination) {
+			return destination, err
+		}
+		buffer.Resize(start, 0)
+	}
+}
+
+func (c *publicPacketConn) public(destination M.Socksaddr) bool {
+	if !destination.IsFqdn() {
+		return !isPrivateAddr(destination.Addr)
+	}
+	addresses, err := c.dns.Lookup(c.ctx, destination.Fqdn, sbadapter.DNSQueryOptions{})
+	return err == nil && !anyPrivate(addresses)
+}
+
+func (c *publicPacketConn) Upstream() any {
+	return c.PacketConn
+}
+
+// checkTarget keeps users off private addresses. The route has resolved a
+// domain, and direct dials exactly those addresses, so a domain passes only
+// when all of them are public.
+func (h *guardOutbound) checkTarget(metadata *sbadapter.InboundContext) error {
+	if !h.blockPrivate {
+		return nil
+	}
+	destination := metadata.Destination
+	if destination.IsFqdn() && (len(metadata.DestinationAddresses) == 0 || anyPrivate(metadata.DestinationAddresses)) ||
+		!destination.IsFqdn() && isPrivateAddr(destination.Addr) {
+		h.guard.logger.Debugf("%s rejected: %v", destination, errPrivateTarget)
+		return errPrivateTarget
+	}
+	return nil
+}
+
+// privatePrefixes are the ranges Xray's geoip:private lists, so nodes block
+// what route.json files used to.
+var privatePrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/3"),  // multicast, reserved and broadcast
+	netip.MustParsePrefix("::/96"),        // unspecified, loopback, IPv4-compatible
+	netip.MustParsePrefix("64:ff9b::/96"), // NAT64 reaches the network's IPv4
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("ff00::/8"),
+}
+
+// isPrivateAddr also holds an invalid address private, so nothing without
+// a known destination passes. A zone ("::%0") hides an address from every
+// prefix, so it goes before the check.
+func isPrivateAddr(addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return true
+	}
+	addr = addr.Unmap().WithZone("")
+	for _, prefix := range privatePrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func anyPrivate(addresses []netip.Addr) bool {
+	return slices.ContainsFunc(addresses, isPrivateAddr)
 }
 
 func (h *guardOutbound) checkAudit(metadata *sbadapter.InboundContext) error {

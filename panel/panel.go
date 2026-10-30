@@ -37,15 +37,21 @@ func New(panelConfig *Config) *Panel {
 	return p
 }
 
-func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
-	// Log Config
-	coreLogConfig := &conf.LogConfig{}
+// logConfig is the Log config with defaults filled in.
+func (p *Panel) logConfig() *LogConfig {
 	logConfig := getDefaultLogConfig()
-	if panelConfig.LogConfig != nil {
-		if _, err := diff.Merge(logConfig, panelConfig.LogConfig, logConfig); err != nil {
+	if p.panelConfig.LogConfig != nil {
+		if _, err := diff.Merge(logConfig, p.panelConfig.LogConfig, logConfig); err != nil {
 			log.Panicf("Read Log config failed: %s", err)
 		}
 	}
+	return logConfig
+}
+
+func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
+	// Log Config
+	coreLogConfig := &conf.LogConfig{}
+	logConfig := p.logConfig()
 	coreLogConfig.LogLevel = logConfig.Level
 	coreLogConfig.AccessLog = logConfig.AccessPath
 	coreLogConfig.ErrorLog = logConfig.ErrorPath
@@ -207,7 +213,9 @@ func (p *Panel) Start() {
 		// they stay on sing-box — which also means they miss the dispatcher's
 		// speed limiter, device limiter and audit rules.
 		if strings.EqualFold(nodeType, "AnyTLS") || strings.EqualFold(nodeType, "Snell") {
-			controllerService = controller.NewSingBoxController(apiClient, controllerConfig, nodeConfig.PanelType)
+			logConfig := p.logConfig()
+			controllerService = controller.NewSingBoxController(apiClient, controllerConfig, nodeConfig.PanelType,
+				controller.SingBoxLog{Level: logConfig.Level, Path: logConfig.ErrorPath})
 		} else {
 			controllerService = controller.New(server, apiClient, controllerConfig, nodeConfig.PanelType)
 		}

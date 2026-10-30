@@ -216,7 +216,19 @@ func startSnellNode(t *testing.T, multiUser bool) (*fakeSnellAPI, string) {
 func startSnellNodeWithPSK(t *testing.T, multiUser bool, psk string) (*fakeSnellAPI, string) {
 	t.Helper()
 	port := freePort(t)
-	f := &fakeSnellAPI{
+	f := newSnellPanel(port, multiUser, psk)
+	c := NewTestSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1})
+	if err := c.Start(); err != nil {
+		t.Fatalf("SingBoxController.Start with a Snell node: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	return f, fmt.Sprintf("127.0.0.1:%d", port)
+}
+
+// newSnellPanel serves a Snell v6 node on port with one user.
+func newSnellPanel(port int, multiUser bool, psk string) *fakeSnellAPI {
+	return &fakeSnellAPI{
 		nodeInfo: &api.NodeInfo{
 			NodeType:          "Snell",
 			NodeID:            1,
@@ -234,14 +246,6 @@ func startSnellNodeWithPSK(t *testing.T, multiUser bool, psk string) (*fakeSnell
 			Email:  snellTestUUID + "@v2board.user",
 		}},
 	}
-
-	c := NewSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1}, "Keeper")
-	if err := c.Start(); err != nil {
-		t.Fatalf("SingBoxController.Start with a Snell node: %v", err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-
-	return f, fmt.Sprintf("127.0.0.1:%d", port)
 }
 
 // snellDial performs a real Snell v6 handshake against the node. An empty
@@ -432,7 +436,7 @@ func TestSnellV5MultiUserIsRefused(t *testing.T) {
 		users: []api.UserInfo{{UID: 42, UUID: snellTestUUID, Passwd: snellTestUUID}},
 	}
 
-	c := NewSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1}, "Keeper")
+	c := NewTestSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1})
 	err := c.Start()
 	if err == nil {
 		_ = c.Close()
@@ -461,7 +465,7 @@ func TestSnellV6MultiUserWithZeroUsersWaitsForUsers(t *testing.T) {
 		users: []api.UserInfo{},
 	}
 
-	c := NewSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1}, "Keeper")
+	c := NewTestSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1})
 	if err := c.Start(); err != nil {
 		t.Fatalf("Start with zero users: %v", err)
 	}

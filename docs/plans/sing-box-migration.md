@@ -1,6 +1,6 @@
 # 主内核从 Xray-core 迁到 sing-box（wkernel）
 
-Status: 已定，实施中（W1、W2、S1、S2、S3 已完成，下一步 S4）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
+Status: 已定，实施中（W1、W2、S1–S4 已完成，下一步阶段 2 的 P1）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
 
 ## 背景与目标
 
@@ -137,6 +137,18 @@ Status: 已定，实施中（W1、W2、S1、S2、S3 已完成，下一步 S4）�
   - 用户从不限速变成限速（自动限速、面板新加限速、节点新加限速）时，guard 断开他未包装的现有连接，客户端重连后就受限：未包装的连接没法事后限速。代价：被限的用户掉线重连一次；节点新加限速时全节点重连一次。已在令牌桶里的连接只改速率，不断开。
   - 日志：每条连接、每个用户每次的流量日志降到 Debug，UDP 日志里写死的 "AnyTLS" 改成实际入站类型；超设备数的 Warn 每个 UID 每分钟最多一条（本节点和跨节点共用一个名额），审计命中的 Warn 每个 UID 每条规则每分钟最多一条；限频用独立的锁，不占 guard 的主锁；已删除用户被拒只打 Debug。
 - **S4** 出站和日志：`SendIP`、`DNSType`、日志级别和错误日志映射（现在 sing-box 控制器把日志整个关掉了）；默认屏蔽私有 IP 和 BT（决定 2）。BT 识别依赖 sniff（S3c 已开）。
+  - 日志：`Log.Level` 映射成 sing-box 的日志级别（`none` 或不填仍是关闭，`warning` → `warn`），`ErrorPath` 作为输出文件，`AccessPath` 没有对应（决定 1）。sing-box 在 info 级别会每条连接打一行，和 Xray 的 info 一样多。`Level: debug` 时 XrayR 自己的日志也降到 Debug 级别（以前 Level 只管 Xray，XrayR 的 Debug 日志永远不显示），其他级别 XrayR 仍打 Info。
+  - 出站：`SendIP` 设成 direct 出站的源地址（IPv4 设 inet4、IPv6 设 inet6），空或未指定地址（`0.0.0.0`、`::`）不绑定；格式错误时节点启动失败。`DNSType` 按 Xray freedom 的读法映射成解析策略（`UseIPv4` → `ipv4_only`、`UseIPv4v6` → `prefer_ipv4`，`AsIs` / `UseIP` → 两种都要），只在 `EnableDNS` 时生效；认不出的值节点启动失败。节点用一个本机 DNS（系统解析器）。
+  - 屏蔽私有地址：路由在 sniff 之后按上面的策略解析域名，guard 在拨号前检查。direct 只拨解析出的那组地址，所以域名只有全部解析结果都是公网才放行（覆盖 `localhost` 和"一半公网一半内网"的域名）。拒绝发生在设备数检查之前，不占名额，只打 Debug。
+    - 私有范围照 Xray 的 `geoip:private`（含 `0.0.0.0/8`、CGNAT `100.64.0.0/10`、`198.18.0.0/15`、`240.0.0.0/4` 等），不用 sing-box 的 `ip_is_private`：它漏掉 CGNAT（阿里云元数据 `100.100.100.200`、Tailscale）这些段。另加 NAT64（`64:ff9b::/96`、`64:ff9b:1::/48`）和 IPv4 兼容地址（`::/96`）。判断前先去掉 IPv6 zone：`::%0` 这种写法按域名类型发来会被解析成带 zone 的地址，任何网段都不包含它，内核却照样当本机。
+    - 不拦服务器自己的公网 IP（Xray 的 `geoip:private` 也不拦）：绑在 0.0.0.0、只靠云安全组或针对外网网卡的防火墙挡住的服务，用户连"服务器公网 IP:端口"仍能从本机访问到。
+    - `0.0.0.0` / `::` 是私有：内核把它当本机，TCP 连 `0.0.0.0:6379` 就是连本机 Redis。唯一的例外是目标就是未指定地址的包连接——legacy UoT 路由时没有目标——放进来后每个包再查。
+    - 包连接（XUDP、UoT）里每个包都查：IP 直接判断，域名先查一次本机 DNS，结果全是公网才放行。direct 会再解析一次，两次之间 DNS 答案变了（DNS rebinding）能绕过，已知未修。
+    - 测试要连本机的回显服务，用只在测试里可见的开关关掉这项检查，其余规则不变。
+  - 屏蔽 BT：只拦 TCP 握手（`network: tcp` + `protocol: bittorrent`，要开 sniff）。sing-box 的 uTP 嗅探会把 WireGuard 握手（`01 00 00 00` 开头）和 RakNet ping 判成 BitTorrent，Xray 的 uTP 嗅探实际从不命中，所以 Xray 节点一直只拦 TCP。
+  - 日志量：sing-box 把扫描器的握手失败、认证失败、拨号失败都记成 ERROR（Xray 记在 Info），`Level: warning` 下 ErrorPath 会比 Xray 时期多出这些行。
+  - `SendIP` 只绑一个协议族，另一族从系统默认地址出去（Xray 的 Go dialer 会只用 SendIP 那一族）；节点都没有 IPv6，暂不处理。Xray 的 `origin` / `srcip` 写法不支持，节点启动报错。
+  - 代码里构造的拒绝规则必须显式写 `method: default`：JSON 解析才会补默认值，空的 method 一命中路由就 panic。
 
 完成后 AnyTLS 和 Snell 节点的功能与 Xray 节点持平。部署一台服务器自用验证，再全量。
 
@@ -174,6 +186,7 @@ Status: 已定，实施中（W1、W2、S1、S2、S3 已完成，下一步 S4）�
 - Reality 和 Vision 两端实现不同（Xray 和 sing-box），P5 是迁移后才首次由 wkernel 同源服务。要先在自己的设备上长时间使用，再全量。
 - ~~S3 实测：限速包装会不会被 splice / 零拷贝绕过。~~ S3b 已核对，不会（见 S3b）。
 - hysteria2 的热更新依赖 sing-quic 的 `UpdateUsers`，它发布用户表时没有同步，是数据竞争。现在镜像只构建 amd64，实际不会出错。上 arm64 之前，必须先在 sing-quic 里改成原子存储。
+- sing-snell v6 的数据竞争（上游，S4 的测试暴露）：连接在服务端第一次回复前关闭时，`CloseWrite` 在锁内写 `session.writer`，另一个拷贝方向的 `FrontHeadroom` 不加锁读它。远端没回包就断开的 Snell UDP / UoT 连接都会碰到，`TestSingBoxNodeBlocksPrivateAndBitTorrent` 在 `-race` 下基本每次都会报出，跑 race 时先 `-skip` 它。根治要在 sing-snell 里给 `FrontHeadroom` 加锁或改成原子读。
 - 热更新会重建 snell 服务，两个副作用：
   - snell v5 的 salt 过滤器被清空，历史抓包的首包可以再重放一次；
   - 每个服务带约 6MB 过滤器，有长连接挂在旧服务上时释放不了。

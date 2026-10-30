@@ -1,14 +1,22 @@
 package controller_test
 
 import (
+	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sagernet/sing-snell/snellv6"
+	"github.com/sagernet/sing/common/buf"
+	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/common/uot"
 
 	"github.com/XrayR-project/XrayR/api"
 	. "github.com/XrayR-project/XrayR/service/controller"
@@ -107,7 +115,7 @@ func TestSingBoxNodeFollowsPanelChanges(t *testing.T) {
 		},
 		users: []api.UserInfo{{UID: 42, UUID: snellTestUUID, Email: "a@test"}},
 	}
-	c := NewSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1}, "Keeper")
+	c := NewTestSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1})
 	if err := c.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -254,7 +262,7 @@ func TestSingBoxNodeLimitsAndReportsOnline(t *testing.T) {
 			{UID: 43, UUID: snellTestUUID2, Email: "b@test"},
 		},
 	}
-	c := NewSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1}, "Keeper")
+	c := NewTestSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1})
 	if err := c.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -372,12 +380,12 @@ func TestSingBoxNodeAutoLimitsFastUsers(t *testing.T) {
 			{UID: 43, UUID: snellTestUUID2, Email: "b@test"},
 		},
 	}
-	c := NewSingBoxController(f, &Config{
+	c := NewTestSingBoxController(f, &Config{
 		ListenIP:       "127.0.0.1",
 		UpdatePeriodic: 1,
 		// 1 Mbps is 125000 bytes per second.
 		AutoSpeedLimitConfig: &AutoSpeedLimitConfig{Limit: 1, LimitSpeed: 1, LimitDuration: 1},
-	}, "Keeper")
+	})
 	if err := c.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -416,4 +424,111 @@ func TestSingBoxNodeAutoLimitsFastUsers(t *testing.T) {
 	if elapsed := timeEcho(snellTestUUID2); elapsed > 500*time.Millisecond {
 		t.Fatalf("a user under the limit took %v for the same", elapsed)
 	}
+}
+
+// A node keeps users off the server's own and its network's addresses, by IP
+// or by a domain that leads there, over TCP and UDP, and off BitTorrent.
+func TestSingBoxNodeBlocksPrivateAndBitTorrent(t *testing.T) {
+	echo := startEchoServer(t)
+	_, echoPort, _ := net.SplitHostPort(echo)
+	udpEcho := startUDPEchoServer(t)
+
+	port := freePort(t)
+	c := NewSingBoxController(newSnellPanel(port, true, snellTestPSK), &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1}, "Keeper", SingBoxLog{})
+	if err := c.Start(); err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	blockingAddr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	for _, target := range []string{
+		echo,
+		net.JoinHostPort("localhost", echoPort),
+		// The kernel takes an unspecified destination for this host.
+		net.JoinHostPort("0.0.0.0", echoPort),
+		net.JoinHostPort("::", echoPort),
+	} {
+		if proxies(t, blockingAddr, snellTestUUID, target) {
+			t.Errorf("reached %s", target)
+		}
+	}
+	if udpEchoes(t, blockingAddr, udpEcho, []byte("probe")) {
+		t.Errorf("reached UDP %s", udpEcho)
+	}
+	// Legacy UoT routes with no destination; the node must keep it open and
+	// drop only the packets to private addresses.
+	conn, err := snellDial(t, blockingAddr, snellTestUUID, uot.LegacyMagicAddress+":0")
+	if err != nil {
+		t.Fatalf("dial legacy UoT: %v", err)
+	}
+	defer conn.Close()
+	// The bare net.Conn hides the snell client's vectorised writer, which
+	// writes into UoT's headroom-less header buffers and panics.
+	packetConn := uot.NewConn(struct{ net.Conn }{conn}, uot.Request{})
+	if _, err := packetConn.WriteTo([]byte("probe"), udpEcho); err != nil {
+		t.Fatalf("send over legacy UoT: %v", err)
+	}
+	// A domain is looked up on the node before the packet goes out.
+	_, udpPort, _ := net.SplitHostPort(udpEcho.String())
+	if err := packetConn.WritePacket(buf.As([]byte("probe")), M.ParseSocksaddr(net.JoinHostPort("localhost", udpPort))); err != nil {
+		t.Fatalf("send over legacy UoT: %v", err)
+	}
+	_ = packetConn.SetReadDeadline(time.Now().Add(time.Second))
+	var timeout net.Error
+	if _, _, err := packetConn.ReadFrom(make([]byte, 64)); !errors.As(err, &timeout) || !timeout.Timeout() {
+		t.Errorf("legacy UoT to %s: got %v, want the packet dropped on an open connection", udpEcho, err)
+	}
+
+	_, allowingAddr := startSnellNode(t, true)
+	if !proxies(t, allowingAddr, snellTestUUID, net.JoinHostPort("localhost", echoPort)) {
+		t.Fatal("a node allowed to reach local servers fails to resolve and proxy localhost")
+	}
+	if !udpEchoes(t, allowingAddr, udpEcho, []byte("probe")) {
+		t.Fatal("a node allowed to reach local servers fails to proxy UDP")
+	}
+	// A WireGuard handshake initiation, which the uTP sniffer takes for
+	// BitTorrent.
+	wireGuard := append([]byte{1, 0, 0, 0}, make([]byte, 144)...)
+	if !udpEchoes(t, allowingAddr, udpEcho, wireGuard) {
+		t.Error("a WireGuard handshake was rejected as BitTorrent")
+	}
+	bt, err := snellDial(t, allowingAddr, snellTestUUID, echo)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer bt.Close()
+	handshake := "\x13BitTorrent protocol" + strings.Repeat("\x00", 48)
+	if got, err := echoThrough(bt, handshake); err == nil && got == handshake {
+		t.Error("a BitTorrent handshake got through")
+	}
+}
+
+// udpEchoes reports whether payload sent over Snell to echo comes back.
+func udpEchoes(t *testing.T, nodeAddr string, echo *net.UDPAddr, payload []byte) bool {
+	t.Helper()
+	client, err := snellv6.NewClient(snellv6.ClientOptions{
+		PSK:     []byte(snellTestPSK),
+		UserKey: []byte(snellTestUUID),
+		Mode:    snellv6.ModeDefault,
+	})
+	if err != nil {
+		t.Fatalf("create Snell client: %v", err)
+	}
+	raw, err := net.Dial("tcp", nodeAddr)
+	if err != nil {
+		t.Fatalf("connect to node: %v", err)
+	}
+	packetConn, err := client.DialPacketConn(raw)
+	if err != nil {
+		_ = raw.Close()
+		return false
+	}
+	defer packetConn.Close()
+	_ = packetConn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := packetConn.WriteTo(payload, echo); err != nil {
+		return false
+	}
+	received := make([]byte, 2048)
+	n, _, err := packetConn.ReadFrom(received)
+	return err == nil && bytes.Equal(received[:n], payload)
 }

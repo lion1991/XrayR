@@ -67,6 +67,18 @@ func getConfig() *viper.Viper {
 	return config
 }
 
+// setLogLevel shows XrayR's own debug logs at the debug level; other levels
+// keep its info logs, which the core's log level never covered.
+func setLogLevel(level string) {
+	debug := strings.EqualFold(level, "debug")
+	log.SetReportCaller(debug)
+	if debug {
+		log.SetLevel(log.DebugLevel)
+	} else {
+		log.SetLevel(log.InfoLevel)
+	}
+}
+
 func run() error {
 	showVersion()
 
@@ -76,9 +88,7 @@ func run() error {
 		return fmt.Errorf("Parse config file %v failed: %s \n", cfgFile, err)
 	}
 
-	if panelConfig.LogConfig.Level == "debug" {
-		log.SetReportCaller(true)
-	}
+	setLogLevel(panelConfig.LogConfig.Level)
 
 	p := panel.New(panelConfig)
 	lastTime := time.Now()
@@ -94,9 +104,7 @@ func run() error {
 				log.Panicf("Parse config file %v failed: %s \n", cfgFile, err)
 			}
 
-			if panelConfig.LogConfig.Level == "debug" {
-				log.SetReportCaller(true)
-			}
+			setLogLevel(panelConfig.LogConfig.Level)
 
 			p.Start()
 			lastTime = time.Now()

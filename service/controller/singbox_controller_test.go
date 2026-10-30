@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -11,6 +12,10 @@ import (
 	"time"
 
 	sbadapter "github.com/sagernet/sing-box/adapter"
+	sbc "github.com/sagernet/sing-box/constant"
+	sboption "github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
@@ -418,5 +423,189 @@ func TestGuardThrottlesRejectionLogs(t *testing.T) {
 	g.rejectLogged["device|1"] = time.Now().Add(-rejectLogEvery)
 	if !g.shouldLog("device|1") {
 		t.Fatal("still throttled after the minute")
+	}
+}
+
+func TestDomainStrategy(t *testing.T) {
+	for _, test := range []struct {
+		enableDNS bool
+		dnsType   string
+		want      uint8
+	}{
+		{false, "UseIPv4", sbc.DomainStrategyAsIS},
+		{true, "", sbc.DomainStrategyAsIS},
+		{true, "AsIs", sbc.DomainStrategyAsIS},
+		{true, "UseIP", sbc.DomainStrategyAsIS},
+		{true, "UseIPv4", sbc.DomainStrategyIPv4Only},
+		{true, "useipv6", sbc.DomainStrategyIPv6Only},
+		{true, "UseIPv4v6", sbc.DomainStrategyPreferIPv4},
+		{true, "ForceIPv6v4", sbc.DomainStrategyPreferIPv6},
+	} {
+		got, err := domainStrategy(&Config{EnableDNS: test.enableDNS, DNSType: test.dnsType})
+		if err != nil || got != sboption.DomainStrategy(test.want) {
+			t.Errorf("EnableDNS %v, DNSType %q: got %v, %v; want %v", test.enableDNS, test.dnsType, got, err, test.want)
+		}
+	}
+	if _, err := domainStrategy(&Config{EnableDNS: true, DNSType: "UseIPv5"}); err == nil {
+		t.Error("an unknown DNSType must stop the node from starting")
+	}
+}
+
+func TestDirectOptionsBindsSendIP(t *testing.T) {
+	for _, test := range []struct {
+		sendIP     string
+		inet4      string
+		inet6      string
+		wantsError bool
+	}{
+		{sendIP: ""},
+		{sendIP: "0.0.0.0"},
+		{sendIP: "::"},
+		{sendIP: "203.0.113.7", inet4: "203.0.113.7"},
+		{sendIP: "::ffff:203.0.113.7", inet4: "203.0.113.7"},
+		{sendIP: "2001:db8::7", inet6: "2001:db8::7"},
+		{sendIP: "example.com", wantsError: true},
+	} {
+		c := &SingBoxController{config: &Config{SendIP: test.sendIP}}
+		options, err := c.directOptions(sboption.DomainStrategy(sbc.DomainStrategyIPv4Only))
+		if (err != nil) != test.wantsError {
+			t.Errorf("SendIP %q: error %v", test.sendIP, err)
+			continue
+		}
+		show := func(addr *badoption.Addr) string {
+			if addr == nil {
+				return ""
+			}
+			return netip.Addr(*addr).String()
+		}
+		if inet4, inet6 := show(options.Inet4BindAddress), show(options.Inet6BindAddress); inet4 != test.inet4 || inet6 != test.inet6 {
+			t.Errorf("SendIP %q: binds %q and %q, want %q and %q", test.sendIP, inet4, inet6, test.inet4, test.inet6)
+		}
+		if !test.wantsError && options.DomainResolver.Strategy != sboption.DomainStrategy(sbc.DomainStrategyIPv4Only) {
+			t.Errorf("SendIP %q: resolver strategy %v", test.sendIP, options.DomainResolver.Strategy)
+		}
+	}
+}
+
+func TestLogOptions(t *testing.T) {
+	for _, test := range []struct {
+		level    string
+		disabled bool
+		want     string
+	}{
+		{level: "", disabled: true},
+		{level: "none", disabled: true},
+		{level: "warning", want: "warn"},
+		{level: "Error", want: "error"},
+		{level: "debug", want: "debug"},
+	} {
+		c := &SingBoxController{log: SingBoxLog{Level: test.level, Path: "/var/log/error.log"}}
+		options := c.logOptions()
+		if options.Disabled != test.disabled || !test.disabled && (options.Level != test.want || options.Output != "/var/log/error.log") {
+			t.Errorf("level %q: got %+v", test.level, options)
+		}
+	}
+}
+
+type scriptedPacketConn struct {
+	N.PacketConn
+	packets []M.Socksaddr
+}
+
+func (c *scriptedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	if len(c.packets) == 0 {
+		return M.Socksaddr{}, io.EOF
+	}
+	destination := c.packets[0]
+	c.packets = c.packets[1:]
+	_, _ = buffer.WriteString(destination.String())
+	return destination, nil
+}
+
+type fakeDNS struct {
+	sbadapter.DNSRouter
+	answers map[string][]netip.Addr
+}
+
+func (d fakeDNS) Lookup(_ context.Context, domain string, _ sbadapter.DNSQueryOptions) ([]netip.Addr, error) {
+	if addresses, ok := d.answers[domain]; ok {
+		return addresses, nil
+	}
+	return nil, errors.New("no such domain")
+}
+
+func addrs(list ...string) []netip.Addr {
+	var addresses []netip.Addr
+	for _, addr := range list {
+		addresses = append(addresses, netip.MustParseAddr(addr))
+	}
+	return addresses
+}
+
+func TestPublicPacketConnDropsPrivatePackets(t *testing.T) {
+	public := M.ParseSocksaddr("1.1.1.1:53")
+	domain := M.ParseSocksaddr("example.com:53")
+	dns := fakeDNS{answers: map[string][]netip.Addr{
+		"example.com": addrs("93.184.215.14"),
+		"local.test":  addrs("127.0.0.1"),
+		"mixed.test":  addrs("1.1.1.1", "0.0.0.0"),
+	}}
+	conn := &publicPacketConn{dns: dns, PacketConn: &scriptedPacketConn{packets: []M.Socksaddr{
+		M.ParseSocksaddr("127.0.0.1:53"),
+		M.ParseSocksaddr("10.0.0.1:53"),
+		M.SocksaddrFromNetIP(netip.AddrPortFrom(netip.MustParseAddr("::ffff:192.168.1.1"), 53)),
+		M.ParseSocksaddr("[fe80::1]:53"),
+		M.ParseSocksaddr("100.100.100.200:80"),
+		M.ParseSocksaddr("0.0.0.0:53"),
+		M.ParseSocksaddr("[::]:53"),
+		M.ParseSocksaddr("local.test:53"),
+		M.ParseSocksaddr("mixed.test:53"),
+		M.ParseSocksaddr("unknown.test:53"),
+		public,
+		domain,
+	}}}
+	for _, want := range []M.Socksaddr{public, domain} {
+		buffer := buf.NewSize(64)
+		buffer.Resize(8, 0) // headroom the caller reserved
+		destination, err := conn.ReadPacket(buffer)
+		if err != nil || destination != want {
+			t.Fatalf("got %v, %v; want %v", destination, err, want)
+		}
+		if buffer.Start() != 8 || string(buffer.Bytes()) != want.String() {
+			t.Fatalf("buffer starts at %d holding %q, want 8 and %q", buffer.Start(), string(buffer.Bytes()), want.String())
+		}
+		buffer.Release()
+	}
+}
+
+func TestGuardRejectsPrivateTargets(t *testing.T) {
+	h := &guardOutbound{guard: newSingBoxGuard(log.NewEntry(log.StandardLogger()), nil), blockPrivate: true}
+	for _, test := range []struct {
+		destination string
+		resolved    []netip.Addr
+		private     bool
+	}{
+		{destination: "1.1.1.1:443"},
+		{destination: "[2606:4700::1111]:443"},
+		{destination: "example.com:443", resolved: addrs("93.184.215.14")},
+		{destination: "127.0.0.1:6379", private: true},
+		{destination: "0.0.0.0:6379", private: true},
+		{destination: "[::]:6379", private: true},
+		{destination: "[::1]:6379", private: true},
+		{destination: "[::ffff:0.0.0.0]:6379", private: true},
+		{destination: "100.100.100.200:80", private: true},
+		{destination: "[::%0]:6379", private: true},
+		{destination: "[::1%lo]:6379", private: true},
+		{destination: "[fe80::1%eth0]:6379", private: true},
+		{destination: "[64:ff9b::7f00:1]:6379", private: true},
+		{destination: "198.18.0.1:80", private: true},
+		{destination: "localhost:6379", resolved: addrs("::1", "127.0.0.1"), private: true},
+		{destination: "mixed.test:6379", resolved: addrs("1.1.1.1", "0.0.0.0"), private: true},
+		{destination: "unresolved.test:443", private: true},
+	} {
+		metadata := sbadapter.InboundContext{Destination: M.ParseSocksaddr(test.destination), DestinationAddresses: test.resolved}
+		if err := h.checkTarget(&metadata); (err != nil) != test.private {
+			t.Errorf("%s (resolved %v): got %v, want private %v", test.destination, test.resolved, err, test.private)
+		}
 	}
 }

@@ -29,6 +29,7 @@ import (
 	sbhysteria2 "github.com/sagernet/sing-box/protocol/hysteria2"
 	sbsnell "github.com/sagernet/sing-box/protocol/snell"
 	"github.com/sagernet/sing/common/json/badoption"
+	N "github.com/sagernet/sing/common/network"
 	log "github.com/sirupsen/logrus"
 	"github.com/xtls/xray-core/common/task"
 
@@ -47,6 +48,10 @@ type SingBoxController struct {
 
 	startAt time.Time
 	logger  *log.Entry
+	log     SingBoxLog
+	// allowPrivate lets connections reach private addresses, for tests that
+	// dial local servers.
+	allowPrivate bool
 
 	// Outlives box rebuilds, so traffic counted before a rebuild still gets
 	// reported after it.
@@ -83,7 +88,13 @@ type SingBoxController struct {
 	lastWarnings []string
 }
 
-func NewSingBoxController(apiClient api.API, config *Config, panelType string) *SingBoxController {
+// SingBoxLog is the panel's Log config as sing-box reads it.
+type SingBoxLog struct {
+	Level string // none, error, warning, info or debug
+	Path  string // empty logs to stderr
+}
+
+func NewSingBoxController(apiClient api.API, config *Config, panelType string, logConfig SingBoxLog) *SingBoxController {
 	logger := log.NewEntry(log.StandardLogger()).WithFields(log.Fields{
 		"Host": apiClient.Describe().APIHost,
 		"Type": apiClient.Describe().NodeType,
@@ -95,6 +106,7 @@ func NewSingBoxController(apiClient api.API, config *Config, panelType string) *
 		panelType: panelType,
 		startAt:   time.Now(),
 		logger:    logger,
+		log:       logConfig,
 	}
 }
 
@@ -710,6 +722,15 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 		inboundOptions = snellOptions
 	}
 
+	strategy, err := domainStrategy(c.config)
+	if err != nil {
+		return nil, err
+	}
+	direct, err := c.directOptions(strategy)
+	if err != nil {
+		return nil, err
+	}
+
 	outReg := sboutbound.NewRegistry()
 	registerGuardOutbound(outReg)
 
@@ -735,9 +756,14 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 
 	options := sb.Options{
 		Options: sboption.Options{
-			Log: &sboption.LogOptions{
-				Disabled: true,
-			},
+			Log: c.logOptions(),
+			DNS: &sboption.DNSOptions{RawDNSOptions: sboption.RawDNSOptions{
+				Servers: []sboption.DNSServerOptions{{
+					Type:    sbc.DNSTypeLocal,
+					Tag:     dnsServerTag,
+					Options: &sboption.LocalDNSServerOptions{},
+				}},
+			}},
 			Inbounds: []sboption.Inbound{
 				{
 					Type:    inboundType,
@@ -751,10 +777,10 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 				{
 					Type:    guardOutboundType,
 					Tag:     "direct",
-					Options: &guardOutboundOptions{guard: c.guard},
+					Options: &guardOutboundOptions{guard: c.guard, direct: direct, blockPrivate: !c.allowPrivate},
 				},
 			},
-			Route: c.routeOptions(),
+			Route: c.routeOptions(strategy),
 		},
 		Context: ctx,
 	}
@@ -767,19 +793,98 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 	return boxInstance, nil
 }
 
-// routeOptions sniffs every connection unless sniffing is off, as Xray nodes
-// do: audit rules match the sniffed domain of a client that dialed an IP.
-func (c *SingBoxController) routeOptions() *sboption.RouteOptions {
-	if c.config.DisableSniffing {
-		return nil
+const dnsServerTag = "local"
+
+// logOptions maps the panel's log level; the Xray-only access log has no
+// counterpart.
+func (c *SingBoxController) logOptions() *sboption.LogOptions {
+	level := strings.ToLower(c.log.Level)
+	switch level {
+	case "", "none":
+		return &sboption.LogOptions{Disabled: true}
+	case "warning":
+		level = "warn"
 	}
-	return &sboption.RouteOptions{
-		Rules: []sboption.Rule{{
-			Type: sbc.RuleTypeDefault,
-			DefaultOptions: sboption.DefaultRule{
-				RuleAction: sboption.RuleAction{Action: sbc.RuleActionTypeSniff},
-			},
-		}},
+	return &sboption.LogOptions{Level: level, Output: c.log.Path, Timestamp: true, DisableColor: true}
+}
+
+// domainStrategy reads DNSType as the Xray freedom outbound does: without
+// EnableDNS, domains resolve in both families.
+func domainStrategy(config *Config) (sboption.DomainStrategy, error) {
+	if !config.EnableDNS {
+		return sboption.DomainStrategy(sbc.DomainStrategyAsIS), nil
+	}
+	switch strings.ToLower(config.DNSType) {
+	case "", "asis", "useip", "forceip":
+		return sboption.DomainStrategy(sbc.DomainStrategyAsIS), nil
+	case "useipv4", "forceipv4":
+		return sboption.DomainStrategy(sbc.DomainStrategyIPv4Only), nil
+	case "useipv6", "forceipv6":
+		return sboption.DomainStrategy(sbc.DomainStrategyIPv6Only), nil
+	case "useipv4v6", "forceipv4v6":
+		return sboption.DomainStrategy(sbc.DomainStrategyPreferIPv4), nil
+	case "useipv6v4", "forceipv6v4":
+		return sboption.DomainStrategy(sbc.DomainStrategyPreferIPv6), nil
+	}
+	return 0, fmt.Errorf("unsupported DNSType %q", config.DNSType)
+}
+
+// directOptions binds outgoing connections to SendIP; an unspecified SendIP
+// leaves the source to the system.
+func (c *SingBoxController) directOptions(strategy sboption.DomainStrategy) (sboption.DirectOutboundOptions, error) {
+	options := sboption.DirectOutboundOptions{DialerOptions: sboption.DialerOptions{AbstractDialerOptions: sboption.AbstractDialerOptions{
+		DomainResolver: &sboption.DomainResolveOptions{Server: dnsServerTag, Strategy: strategy},
+	}}}
+	if c.config.SendIP == "" {
+		return options, nil
+	}
+	addr, err := netip.ParseAddr(c.config.SendIP)
+	if err != nil {
+		return options, fmt.Errorf("invalid SendIP %q: %w", c.config.SendIP, err)
+	}
+	addr = addr.Unmap()
+	bind := badoption.Addr(addr)
+	switch {
+	case addr.IsUnspecified():
+	case addr.Is4():
+		options.Inet4BindAddress = &bind
+	default:
+		options.Inet6BindAddress = &bind
+	}
+	return options, nil
+}
+
+// routeOptions sniffs every connection unless sniffing is off, as Xray nodes
+// do: audit rules match the sniffed domain of a client that dialed an IP. It
+// then resolves domains, so the guard sees the addresses direct will dial,
+// and rejects BitTorrent (which takes sniffing).
+func (c *SingBoxController) routeOptions(strategy sboption.DomainStrategy) *sboption.RouteOptions {
+	var rules []sboption.Rule
+	if !c.config.DisableSniffing {
+		rules = append(rules, actionRule(sboption.RawDefaultRule{}, sboption.RuleAction{Action: sbc.RuleActionTypeSniff}))
+	}
+	rules = append(rules, actionRule(sboption.RawDefaultRule{}, sboption.RuleAction{
+		Action:         sbc.RuleActionTypeResolve,
+		ResolveOptions: sboption.RouteActionResolve{Server: dnsServerTag, Strategy: strategy},
+	}))
+	// Only the TCP handshake: the UDP uTP sniffer also takes WireGuard and
+	// RakNet handshakes for BitTorrent, and Xray's never matched UDP at all.
+	// Options built in code skip the JSON defaults; the router panics on an
+	// empty reject method.
+	rules = append(rules, actionRule(sboption.RawDefaultRule{
+		Network:  badoption.Listable[string]{N.NetworkTCP},
+		Protocol: badoption.Listable[string]{sbc.ProtocolBitTorrent},
+	}, sboption.RuleAction{
+		Action:        sbc.RuleActionTypeReject,
+		RejectOptions: sboption.RejectActionOptions{Method: sbc.RuleActionRejectMethodDefault},
+	}))
+	return &sboption.RouteOptions{Rules: rules}
+}
+
+func actionRule(match sboption.RawDefaultRule, action sboption.RuleAction) sboption.Rule {
+	return sboption.Rule{
+		Type:           sbc.RuleTypeDefault,
+		DefaultOptions: sboption.DefaultRule{RawDefaultRule: match, RuleAction: action},
 	}
 }
 
