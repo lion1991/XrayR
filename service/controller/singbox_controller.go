@@ -33,6 +33,7 @@ import (
 	"github.com/xtls/xray-core/common/task"
 
 	"github.com/XrayR-project/XrayR/api"
+	"github.com/XrayR-project/XrayR/common/limiter"
 )
 
 type SingBoxController struct {
@@ -109,7 +110,7 @@ func (c *SingBoxController) Start() error {
 		return err
 	}
 	c.traffic = newSingBoxTrafficTracker(c.logger)
-	c.guard = newSingBoxGuard()
+	c.guard = newSingBoxGuard(c.logger, limiter.NewGlobalLimiter(c.config.GlobalDeviceLimitConfig))
 	c.credentials = make(map[int]credential)
 
 	c.access.Lock()
@@ -222,6 +223,8 @@ func (c *SingBoxController) sync() error {
 	nodeInfo := c.nodeInfo
 	users, secrets, warnings := validUsers(*c.userList)
 	c.trackCredentials(users, secrets)
+	// Limits change without touching the inbound.
+	c.guard.setPolicies(nodeInfo.SpeedLimit, users)
 	needUsers := nodeNeedsUsers(nodeInfo)
 	if needUsers && len(users) == 0 {
 		// An inbound with no users is never what the panel means: snell
@@ -745,6 +748,11 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 func (c *SingBoxController) trafficMonitor() error {
 	if time.Since(c.startAt) < time.Duration(c.config.UpdatePeriodic)*time.Second {
 		return nil
+	}
+	if online := c.guard.onlineUsers(); len(online) > 0 {
+		if err := c.apiClient.ReportNodeOnlineUsers(&online); err != nil {
+			c.logger.Print(err)
+		}
 	}
 	type pending struct {
 		counter  *userCounter

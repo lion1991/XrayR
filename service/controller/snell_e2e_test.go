@@ -38,6 +38,7 @@ type fakeSnellAPI struct {
 	reported []api.UserTraffic
 	// keeper keys a report by uid, so a repeated uid loses traffic there.
 	repeatedUID bool
+	online      [][]api.OnlineUser
 }
 
 func (f *fakeSnellAPI) GetNodeInfo() (*api.NodeInfo, error) {
@@ -91,11 +92,33 @@ func (f *fakeSnellAPI) Describe() api.ClientInfo {
 	return api.ClientInfo{APIHost: "fake", NodeID: 1, NodeType: f.nodeInfo.NodeType}
 }
 
-func (f *fakeSnellAPI) ReportNodeStatus(*api.NodeStatus) error        { return nil }
-func (f *fakeSnellAPI) ReportNodeOnlineUsers(*[]api.OnlineUser) error { return nil }
-func (f *fakeSnellAPI) GetNodeRule() (*[]api.DetectRule, error)       { return &[]api.DetectRule{}, nil }
-func (f *fakeSnellAPI) ReportIllegal(*[]api.DetectResult) error       { return nil }
-func (f *fakeSnellAPI) Debug()                                        {}
+func (f *fakeSnellAPI) ReportNodeStatus(*api.NodeStatus) error { return nil }
+func (f *fakeSnellAPI) ReportNodeOnlineUsers(online *[]api.OnlineUser) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.online = append(f.online, append([]api.OnlineUser(nil), *online...))
+	return nil
+}
+
+// onlineReports returns how many online reports listed uid.
+func (f *fakeSnellAPI) onlineReports(uid int) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, report := range f.online {
+		for _, user := range report {
+			if user.UID == uid {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
+func (f *fakeSnellAPI) GetNodeRule() (*[]api.DetectRule, error) { return &[]api.DetectRule{}, nil }
+func (f *fakeSnellAPI) ReportIllegal(*[]api.DetectResult) error { return nil }
+func (f *fakeSnellAPI) Debug()                                  {}
 
 // trafficFor sums everything the controller has pushed for a uid so far.
 func (f *fakeSnellAPI) trafficFor(uid int) (up, down int64) {

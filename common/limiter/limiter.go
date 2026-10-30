@@ -7,15 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/eko/gocache/lib/v4/cache"
-	"github.com/eko/gocache/lib/v4/marshaler"
-	"github.com/eko/gocache/lib/v4/store"
-	goCacheStore "github.com/eko/gocache/store/go_cache/v4"
-	redisStore "github.com/eko/gocache/store/redis/v4"
-	goCache "github.com/patrickmn/go-cache"
-	"github.com/redis/go-redis/v9"
 	"github.com/xtls/xray-core/common/errors"
 	"golang.org/x/time/rate"
 
@@ -34,10 +26,7 @@ type InboundInfo struct {
 	UserInfo       *sync.Map // Key: Email value: UserInfo
 	BucketHub      *sync.Map // key: Email, value: *rate.Limiter
 	UserOnlineIP   *sync.Map // Key: Email, value: {Key: IP, value: UID}
-	GlobalLimit    struct {
-		config         *GlobalDeviceLimitConfig
-		globalOnlineIP *marshaler.Marshaler
-	}
+	GlobalLimit    *GlobalLimiter
 }
 
 type Limiter struct {
@@ -58,30 +47,7 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 		UserOnlineIP:   new(sync.Map),
 	}
 
-	if globalLimit != nil && globalLimit.Enable {
-		inboundInfo.GlobalLimit.config = globalLimit
-
-		// init local store
-		gs := goCacheStore.NewGoCache(goCache.New(time.Duration(globalLimit.Expiry)*time.Second, 1*time.Minute))
-
-		// init redis store
-		rs := redisStore.NewRedis(redis.NewClient(
-			&redis.Options{
-				Network:  globalLimit.RedisNetwork,
-				Addr:     globalLimit.RedisAddr,
-				Username: globalLimit.RedisUsername,
-				Password: globalLimit.RedisPassword,
-				DB:       globalLimit.RedisDB,
-			}),
-			store.WithExpiration(time.Duration(globalLimit.Expiry)*time.Second))
-
-		// init chained cache. First use local go-cache, if go-cache is nil, then use redis cache
-		cacheManager := cache.NewChain[any](
-			cache.New[any](gs), // go-cache is priority
-			cache.New[any](rs),
-		)
-		inboundInfo.GlobalLimit.globalOnlineIP = marshaler.New(cacheManager)
-	}
+	inboundInfo.GlobalLimit = NewGlobalLimiter(globalLimit)
 
 	userMap := new(sync.Map)
 	for _, u := range *userList {
@@ -181,11 +147,14 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 		// Local device limit
 		ipMap := new(sync.Map)
 		ipMap.Store(ip, uid)
+		newIP := true
 		// If any device is online
 		if v, ok := inboundInfo.UserOnlineIP.LoadOrStore(email, ipMap); ok {
-			ipMap := v.(*sync.Map)
+			ipMap = v.(*sync.Map)
 			// If this is a new ip
-			if _, ok := ipMap.LoadOrStore(ip, uid); !ok {
+			_, known := ipMap.LoadOrStore(ip, uid)
+			newIP = !known
+			if newIP {
 				counter := 0
 				ipMap.Range(func(key, value interface{}) bool {
 					counter++
@@ -199,8 +168,14 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 		}
 
 		// GlobalLimit
-		if inboundInfo.GlobalLimit.config != nil && inboundInfo.GlobalLimit.config.Enable {
-			if reject := globalLimit(inboundInfo, email, uid, ip, deviceLimit); reject {
+		if inboundInfo.GlobalLimit != nil {
+			// reformat email for unique key
+			uniqueKey := strings.Replace(email, inboundInfo.Tag, strconv.Itoa(deviceLimit), 1)
+			if reject := inboundInfo.GlobalLimit.Reject(uniqueKey, uid, ip, deviceLimit); reject {
+				// A rejected device must not count, or be reported, as online here.
+				if newIP {
+					ipMap.Delete(ip)
+				}
 				return nil, false, true
 			}
 		}
@@ -221,51 +196,6 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 	} else {
 		errors.LogDebug(context.Background(), "Get Inbound Limiter information failed")
 		return nil, false, false
-	}
-}
-
-// Global device limit
-func globalLimit(inboundInfo *InboundInfo, email string, uid int, ip string, deviceLimit int) bool {
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(inboundInfo.GlobalLimit.config.Timeout)*time.Second)
-	defer cancel()
-
-	// reformat email for unique key
-	uniqueKey := strings.Replace(email, inboundInfo.Tag, strconv.Itoa(deviceLimit), 1)
-
-	v, err := inboundInfo.GlobalLimit.globalOnlineIP.Get(ctx, uniqueKey, new(map[string]int))
-	if err != nil {
-		if _, ok := err.(*store.NotFound); ok {
-			// If the email is a new device
-			go pushIP(inboundInfo, uniqueKey, &map[string]int{ip: uid})
-		} else {
-			errors.LogErrorInner(context.Background(), err, "cache service")
-		}
-		return false
-	}
-
-	ipMap := v.(*map[string]int)
-	// Reject device reach limit directly
-	if deviceLimit > 0 && len(*ipMap) > deviceLimit {
-		return true
-	}
-
-	// If the ip is not in cache
-	if _, ok := (*ipMap)[ip]; !ok {
-		(*ipMap)[ip] = uid
-		go pushIP(inboundInfo, uniqueKey, ipMap)
-	}
-
-	return false
-}
-
-// push the ip to cache
-func pushIP(inboundInfo *InboundInfo, uniqueKey string, ipMap *map[string]int) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(inboundInfo.GlobalLimit.config.Timeout)*time.Second)
-	defer cancel()
-
-	if err := inboundInfo.GlobalLimit.globalOnlineIP.Set(ctx, uniqueKey, ipMap); err != nil {
-		errors.LogErrorInner(context.Background(), err, "cache service")
 	}
 }
 

@@ -63,6 +63,18 @@ func startCountingEchoServer(t *testing.T) (addr string, received *atomic.Int64)
 	return l.Addr().String(), received
 }
 
+func echoThroughWithin(conn net.Conn, payload string, timeout time.Duration) (string, error) {
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return "", err
+	}
+	go func() { _, _ = conn.Write([]byte(payload)) }()
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
 // proxies reports whether a client holding userKey gets a payload echoed.
 func proxies(t *testing.T, nodeAddr, userKey, echo string) bool {
 	t.Helper()
@@ -217,4 +229,66 @@ func TestSingBoxNodeFollowsPanelChanges(t *testing.T) {
 	if repeated {
 		t.Fatal("a traffic report listed the same uid twice; keeper keeps only one of them")
 	}
+}
+
+// A user with a long-lived connection stays online report after report, and
+// a speed limit slows a user's traffic down while others run free.
+func TestSingBoxNodeLimitsAndReportsOnline(t *testing.T) {
+	echo := startEchoServer(t)
+	port := freePort(t)
+	nodeAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	const limit = 20000 // bytes per second
+	f := &fakeSnellAPI{
+		nodeInfo: &api.NodeInfo{
+			NodeType:       "Snell",
+			NodeID:         1,
+			Port:           uint32(port),
+			SnellVersion:   6,
+			SnellPSK:       snellTestPSK,
+			SnellMultiUser: true,
+		},
+		users: []api.UserInfo{
+			{UID: 42, UUID: snellTestUUID, Email: "a@test", SpeedLimit: limit},
+			{UID: 43, UUID: snellTestUUID2, Email: "b@test"},
+		},
+	}
+	c := NewSingBoxController(f, &Config{ListenIP: "127.0.0.1", UpdatePeriodic: 1}, "Keeper")
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	payload := string(make([]byte, limit))
+	timeEcho := func(userKey string) time.Duration {
+		conn, err := snellDial(t, nodeAddr, userKey, echo)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		start := time.Now()
+		if got, err := echoThroughWithin(conn, payload, 10*time.Second); err != nil || got != payload {
+			t.Fatalf("echo %d bytes: %v", len(payload), err)
+		}
+		return time.Since(start)
+	}
+	// One burst is free, the other half of the round trip waits a second.
+	if elapsed := timeEcho(snellTestUUID); elapsed < 800*time.Millisecond {
+		t.Fatalf("a %d B/s user moved %d bytes both ways in %v", limit, len(payload), elapsed)
+	}
+	if elapsed := timeEcho(snellTestUUID2); elapsed > 500*time.Millisecond {
+		t.Fatalf("an unlimited user took %v for the same", elapsed)
+	}
+
+	long, err := snellDial(t, nodeAddr, snellTestUUID2, echo)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer long.Close()
+	if _, err := echoThrough(long, "hello"); err != nil {
+		t.Fatalf("proxy: %v", err)
+	}
+	before := f.onlineReports(43)
+	waitFor(t, "three more online reports listing uid 43", func() bool {
+		return f.onlineReports(43) >= before+3
+	})
 }

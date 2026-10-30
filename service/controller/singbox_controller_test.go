@@ -1,11 +1,19 @@
 package controller
 
 import (
+	"context"
+	"io"
+	"net"
+	"net/netip"
 	"reflect"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	sbadapter "github.com/sagernet/sing-box/adapter"
+	N "github.com/sagernet/sing/common/network"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 
 	"github.com/XrayR-project/XrayR/api"
 )
@@ -78,34 +86,175 @@ func (r *closeRecorder) Close() error {
 	return nil
 }
 
+var testIP = netip.MustParseAddr("192.0.2.1")
+
+func testGuard() *singBoxGuard {
+	return newSingBoxGuard(log.NewEntry(log.StandardLogger()), nil)
+}
+
+func admitted(g *singBoxGuard, user string, ip netip.Addr, conn io.Closer) (func(), bool) {
+	release, _, err := g.admit(user, ip, conn)
+	return release, err == nil
+}
+
 func TestGuardAdmitsOnlyServedUsers(t *testing.T) {
-	g := newSingBoxGuard()
-	if _, ok := g.admit("a", &closeRecorder{}); ok {
+	g := testGuard()
+	a, b := userTag("n", &api.UserInfo{UID: 1}, 0), userTag("n", &api.UserInfo{UID: 2}, 0)
+	if _, ok := admitted(g, a, testIP, &closeRecorder{}); ok {
 		t.Fatal("admitted a user before any user list")
 	}
-	if _, ok := g.admit("", &closeRecorder{}); !ok {
+	if _, ok := admitted(g, "", testIP, &closeRecorder{}); !ok {
 		t.Fatal("rejected a connection without user (shared-psk snell)")
 	}
-	g.admitOnly([]string{"a", "b"})
+	g.admitOnly([]string{a, b})
 	connA, connB, gone := &closeRecorder{}, &closeRecorder{}, &closeRecorder{}
-	if _, ok := g.admit("a", connA); !ok {
+	if _, ok := admitted(g, a, testIP, connA); !ok {
 		t.Fatal("rejected served user a")
 	}
-	if _, ok := g.admit("b", connB); !ok {
+	if _, ok := admitted(g, b, testIP, connB); !ok {
 		t.Fatal("rejected served user b")
 	}
-	release, _ := g.admit("b", gone)
+	release, _ := admitted(g, b, testIP, gone)
 	release()
 
-	g.admitOnly([]string{"a"})
+	g.admitOnly([]string{a})
 	if !connB.closed.Load() {
 		t.Fatal("removed user b keeps its connection")
 	}
 	if connA.closed.Load() || gone.closed.Load() {
 		t.Fatal("closed a connection of a served user, or one already released")
 	}
-	if _, ok := g.admit("b", &closeRecorder{}); ok {
+	if _, ok := admitted(g, b, testIP, &closeRecorder{}); ok {
 		t.Fatal("removed user b opened a new connection")
+	}
+}
+
+// Devices are the IPs seen since the last report, so a device that
+// disconnected keeps its slot until the report. A live connection does not
+// hold a slot after it (its socket may be dead on a network the phone left),
+// but is still reported online.
+func TestGuardDeviceLimit(t *testing.T) {
+	g := testGuard()
+	user := api.UserInfo{UID: 7, DeviceLimit: 2}
+	name := userTag("n", &user, 0)
+	g.admitOnly([]string{name})
+	g.setPolicies(0, []api.UserInfo{user})
+	ip := func(s string) netip.Addr { return netip.MustParseAddr(s) }
+
+	releaseA, okA := admitted(g, name, ip("192.0.2.1"), &closeRecorder{})
+	releaseB, okB := admitted(g, name, ip("192.0.2.2"), &closeRecorder{})
+	if !okA || !okB {
+		t.Fatal("rejected a device within the limit")
+	}
+	if _, ok := admitted(g, name, ip("192.0.2.3"), &closeRecorder{}); ok {
+		t.Fatal("admitted a third device over a limit of 2")
+	}
+	if _, ok := admitted(g, name, ip("192.0.2.1"), &closeRecorder{}); !ok {
+		t.Fatal("rejected a second connection from a known device")
+	}
+	releaseB()
+	if _, ok := admitted(g, name, ip("192.0.2.3"), &closeRecorder{}); ok {
+		t.Fatal("a device that just disconnected lost its slot before the report")
+	}
+
+	want := []api.OnlineUser{{UID: 7, IP: "192.0.2.1"}, {UID: 7, IP: "192.0.2.2"}}
+	if got := g.onlineUsers(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("online = %+v, want %+v", got, want)
+	}
+	_, okC := admitted(g, name, ip("192.0.2.3"), &closeRecorder{})
+	_, okD := admitted(g, name, ip("192.0.2.4"), &closeRecorder{})
+	if !okC || !okD {
+		t.Fatal("the live device 192.0.2.1 still holds a slot after the report")
+	}
+	if _, ok := admitted(g, name, ip("192.0.2.1"), &closeRecorder{}); ok {
+		t.Fatal("admitted a third device in the new period")
+	}
+	want = []api.OnlineUser{{UID: 7, IP: "192.0.2.1"}, {UID: 7, IP: "192.0.2.3"}, {UID: 7, IP: "192.0.2.4"}}
+	if got := g.onlineUsers(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("online = %+v, want %+v with the long-lived device", got, want)
+	}
+	releaseA()
+}
+
+func TestGuardSpeedLimit(t *testing.T) {
+	g := testGuard()
+	limited := api.UserInfo{UID: 1, SpeedLimit: 1000}
+	free := api.UserInfo{UID: 2}
+	names := []string{userTag("n", &limited, 0), userTag("n", &free, 0)}
+	g.admitOnly(names)
+	g.setPolicies(0, []api.UserInfo{limited, free})
+
+	_, bucket, _ := g.admit(names[0], testIP, &closeRecorder{})
+	_, again, _ := g.admit(names[0], testIP, &closeRecorder{})
+	if bucket == nil || bucket != again {
+		t.Fatal("a limited user's connections do not share one bucket")
+	}
+	if _, none, _ := g.admit(names[1], testIP, &closeRecorder{}); none != nil {
+		t.Fatal("an unlimited user got a bucket")
+	}
+	// A node limit applies to everyone, the stricter one wins.
+	g.setPolicies(500, []api.UserInfo{limited, free})
+	if bucket.Limit() != 500 {
+		t.Fatalf("limit = %v after a stricter node limit, want 500", bucket.Limit())
+	}
+	if _, nodeBucket, _ := g.admit(names[1], testIP, &closeRecorder{}); nodeBucket == nil || nodeBucket.Limit() != 500 {
+		t.Fatal("the node limit does not apply to a user without one")
+	}
+	g.setPolicies(0, []api.UserInfo{{UID: 1}, free})
+	if bucket.Limit() != rate.Inf {
+		t.Fatal("lifting the limit left open connections limited")
+	}
+}
+
+// One read larger than the burst must still wait its share.
+func TestWaitTokensSplitsLargeReads(t *testing.T) {
+	bucket := rate.NewLimiter(rate.Limit(10000), 10000)
+	start := time.Now()
+	waitTokens(bucket, 25000)
+	if elapsed := time.Since(start); elapsed < time.Second {
+		t.Fatalf("25000 bytes at 10000 B/s with a 10000 burst took %v, want about 1.5s", elapsed)
+	}
+}
+
+// The copy half-closes a finished direction through CloseWrite; the limiter
+// must not turn that into a full close.
+func TestRateConnHalfCloses(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	// As in production: the traffic counter below, unwrapped like the copy does.
+	counted := newSingBoxTrafficTracker(nil).RoutedConnection(context.Background(), server,
+		sbadapter.InboundContext{User: "u"}, nil, nil)
+	limited := &rateConn{Conn: counted, bucket: rate.NewLimiter(rate.Inf, 0)}
+	writer, _ := N.UnwrapCountWriter(limited, nil)
+	closer, ok := N.UnwrapWriter(writer).(N.WriteCloser)
+	if !ok {
+		t.Fatal("the copy finds no CloseWrite on the limited conn")
+	}
+	if err := closer.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("client read %v after CloseWrite, want EOF", err)
+	}
+	if _, err := client.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := limited.Read(make([]byte, 1)); err != nil {
+		t.Fatalf("the limited conn cannot read after its CloseWrite: %v", err)
 	}
 }
 
@@ -129,6 +278,7 @@ func TestTrafficMonitorMergesNamesOfOneUID(t *testing.T) {
 		apiClient: panel,
 		logger:    log.NewEntry(log.StandardLogger()),
 		traffic:   newSingBoxTrafficTracker(nil),
+		guard:     testGuard(),
 	}
 	user := api.UserInfo{UID: 42, Email: "a@test"}
 	oldName := userTag("Snell_127.0.0.1_1000", &user, 0)

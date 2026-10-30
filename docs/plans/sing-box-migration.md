@@ -112,6 +112,18 @@ Status: 已定，实施中（W1、W2、S1、S2 已完成，下一步 S3）。架
   - 改了 email 的用户名字也会变，也会被断开一次。很少发生，不做特殊处理。
   - 已知遗留：被拒的连接没有日志，追踪器还会先打一条这个用户的 Info 连接日志，S3d 降级日志时一并处理。
   - e2e 只能验证已建立的连接被关闭；“已认证的会话开不了新流”需要多路复用的客户端，由单测 `TestGuardAdmitsOnlyServedUsers` 覆盖。
+
+  S3b 已完成（回归用例 `TestSingBoxNodeLimitsAndReportsOnline`、`TestGuardDeviceLimit`、`TestGuardSpeedLimit`、`TestWaitTokensSplitsLargeReads`、`TestRateConnHalfCloses`、`TestAddDevice`）：
+  - 限速和设备数都由 guard 在拨号前决定。限速和设备数来自 keeper 的本地配置 `SpeedLimit` / `DeviceLimit`，用户限速也可以来自面板的 `speed_limit`，节点限速和用户限速取更严的。只改限速或设备数时，不重建 box、不断连接。
+  - 设备 = 上次在线上报后建过连接的 IP，和 Xray 一样。超出设备数的新 IP 被拒，已知 IP 不受影响；断开的设备要等下次上报才让出名额。
+  - 存活连接不占设备名额。review 时考虑过让它占名额，不采用：手机从 WiFi 切到 4G 后，旧 IP 上的死连接要等 TCP keepalive（5 分钟起，最长十几分钟）才断，设备数为 1 的用户会被锁在外面这么久。代价和 Xray 一样：上报后另一台设备可以抢走长连接设备的名额，之后长连接设备的新连接被拒。
+  - 在线 IP 上报 = 上报周期内见过的 IP ∪ 有存活连接的 IP，每个流量周期报一次，长连接用户不再漏报。
+  - 跨节点设备数（Redis，`GlobalDeviceLimitConfig`）从 `common/limiter` 抽成 `GlobalLimiter`，两套控制器共用，key 格式不变（`设备数|email|uid`），所以 Xray 节点和 sing-box 节点按同一份名单计数。sing-box 侧只在设了设备数时才访问 Redis。缓存出错的日志改走 logrus。顺手修了上游的计数 bug（Xray 节点也受益）：原来先判断 `已有 IP 数 > 设备数` 再加入，会多放进一台设备，之后连已有设备也全部被拒，直到 key 过期；现在已知 IP 总是放行，新 IP 在 `已有 IP 数 >= 设备数` 时被拒（`TestAddDevice`）。Xray 侧被全局检查拒掉的新 IP 也从本地在线名单里删掉，不再占本地名额、不再被上报在线（原来只有本地拒绝才删；这一处没有单测，Redis 部分需要真实 Redis）。
+  - 已知未修（上游原样，概率低）：写 Redis 是异步的整表覆盖，两台新设备同时上线会丢掉一个；sing-box 侧写入 Redis 后，如果本地复查时用户刚被删或名额被抢，这个 IP 会在 Redis 里白占一个名额直到过期。
+  - 限速：每个 UID 一个令牌桶，上下行共用，容量为一秒的量（和 Xray 一样）。一次读写超过桶容量时分段等待：`WaitN` 遇到超过容量的请求会直接报错，Xray 的实现在这种情况下会放过整块数据不限速。
+  - 只有建连时有限速的用户才包装连接，没限速的用户走原来的拷贝路径。包装层转发 `CloseWrite`（和拷贝一样先越过下面的流量计数层），不把半关闭变成全关闭（snell v5 靠它告诉客户端目标为什么断开；`TestRateConnHalfCloses`）。限速被取消时，令牌桶改成不限，已有连接立即生效；没限速的用户新加了限速，只对新连接生效（Xray 也是这样）。自动限速要对已有连接生效，留给 S3d 处理。
+  - 留给 S3d：超设备数时每条被拒的流都打一条 Warn，客户端重试会刷屏，降级日志时改成限频；限速等待中的连接关闭后要等这段等待结束才释放（有界，不会卡死）。
+  - 已核对：sing 的拷贝只在包装层声明可替换时才拆包装，splice 只用于 TUN，所以限速包装不会被零拷贝绕过（第 4 节的待实测项已有结论）。
 - **S4** 出站和日志：`SendIP`、`DNSType`、默认路由 sniff、日志级别和错误日志映射（现在 sing-box 控制器把日志整个关掉了）；默认屏蔽私有 IP 和 BT（决定 2）。BT 识别依赖 sniff。
 
 完成后 AnyTLS 和 Snell 节点的功能与 Xray 节点持平。部署一台服务器自用验证，再全量。
@@ -148,7 +160,7 @@ Status: 已定，实施中（W1、W2、S1、S2 已完成，下一步 S3）。架
 
 - wkernel 跟随上游 alpha，内部 API 经常变（v1.14 起就遇到过证书注册表变化）。服务端补丁会增加每次同步的冲突面。缓解办法：补丁尽量集中在一个接口上，同步验收清单里加上服务端 e2e 测试。
 - Reality 和 Vision 两端实现不同（Xray 和 sing-box），P5 是迁移后才首次由 wkernel 同源服务。要先在自己的设备上长时间使用，再全量。
-- S3 实测：限速包装会不会被 splice / 零拷贝绕过。
+- ~~S3 实测：限速包装会不会被 splice / 零拷贝绕过。~~ S3b 已核对，不会（见 S3b）。
 - hysteria2 的热更新依赖 sing-quic 的 `UpdateUsers`，它发布用户表时没有同步，是数据竞争。现在镜像只构建 amd64，实际不会出错。上 arm64 之前，必须先在 sing-quic 里改成原子存储。
 - 热更新会重建 snell 服务，两个副作用：
   - snell v5 的 salt 过滤器被清空，历史抓包的首包可以再重放一次；
