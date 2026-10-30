@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/uuid/v5"
 	sbadapter "github.com/sagernet/sing-box/adapter"
 	sbc "github.com/sagernet/sing-box/constant"
 	sboption "github.com/sagernet/sing-box/option"
@@ -46,6 +47,23 @@ func TestValidUsers(t *testing.T) {
 	}
 	if len(skipped) != 3 {
 		t.Fatalf("skipped = %q, want one reason each for uid 3, the second uid 2 and the shared secret", skipped)
+	}
+}
+
+// A VLESS id is a uuid however it is spelled, so two spellings of one uuid
+// are one user to the node.
+func TestValidUsersVLESS(t *testing.T) {
+	valid, secrets, skipped := validUsers([]api.UserInfo{
+		{UID: 1, UUID: "AAAAAAAA-0000-0000-0000-000000000001"},
+		{UID: 2, UUID: "aaaaaaaa-0000-0000-0000-000000000001"},
+		{UID: 3, UUID: "not-a-uuid"},
+	}, nodeSecret(&api.NodeInfo{NodeType: "Vless", EnableVless: true}))
+	if len(valid) != 1 || valid[0].UID != 3 || len(skipped) != 1 {
+		t.Fatalf("valid = %v, skipped = %q, want only uid 3", valid, skipped)
+	}
+	// sing-vmess and Xray map a string that is not a uuid to its UUIDv5.
+	if want := uuid.NewV5(uuid.Nil, "not-a-uuid").String(); secrets[0] != want {
+		t.Fatalf("secret %q, want %q", secrets[0], want)
 	}
 }
 

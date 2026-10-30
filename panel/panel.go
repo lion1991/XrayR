@@ -207,7 +207,8 @@ func (p *Panel) Start() {
 		nodeType := apiClient.Describe().NodeType
 		// Protocols move to sing-box one by one (docs/plans/sing-box-migration.md);
 		// the rest still run on Xray.
-		if strings.EqualFold(nodeType, "AnyTLS") || strings.EqualFold(nodeType, "Snell") || strings.EqualFold(nodeType, "Trojan") ||
+		vless := strings.EqualFold(nodeType, "Vless") || strings.EqualFold(nodeType, "V2ray") && nodeConfig.ApiConfig.EnableVless
+		if vless || strings.EqualFold(nodeType, "AnyTLS") || strings.EqualFold(nodeType, "Snell") || strings.EqualFold(nodeType, "Trojan") ||
 			strings.EqualFold(nodeType, "Shadowsocks") || strings.EqualFold(nodeType, "Hysteria") {
 			logConfig := p.logConfig()
 			controllerService = controller.NewSingBoxController(apiClient, controllerConfig, nodeConfig.PanelType,

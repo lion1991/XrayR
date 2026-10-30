@@ -1,6 +1,6 @@
 # 主内核从 Xray-core 迁到 sing-box（wkernel）
 
-Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，下一步 P4）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
+Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，P4 取消，P5 已完成，下一步 R0）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
 
 ## 背景与目标
 
@@ -29,6 +29,7 @@ Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，下一步 P
 4. **CI 拉取 wkernel 的凭据**（已定、已配好）。XrayR 继续在 GitHub Actions 构建、推 ghcr.io，不搬到 Forgejo，也不把 wkernel 镜像到 GitHub（两者都要多存一个凭据，服务器拉取地址或同步链路还得跟着变）。凭据是 Wkernel 仓库上的 deploy key `xrayr-github-ci`，**只读**：私钥存 XrayR 的 Actions secret `WKERNEL_DEPLOY_KEY`，本机副本在 `~/.ssh/wkernel_deploy`。已实测能读、写被拒。
    - 否决：给这把 key 写权限。私钥在公开仓库的 CI 里，泄露即可往所有客户端的内核投毒；以后真要 CI 写 wkernel，另加一把 key。
    - 已实测（2026-10-30，Actions run 41002508939）：GitHub 构建机能直接连上 `git.wrlog.cn:2222`，不需要把 wkernel 镜像到 GitHub。
+5. **不迁 VMess 和非 Reality 的 VLESS**（2026-10-30 用户决定：现在不会用了）。原 P4 取消，VLESS 只做 Reality（+ Vision）。删除 Xray 后，面板下发 VMess 节点或不带 Reality 的 VLESS 节点时启动报错，不静默降级。
 
 ## 2. 架构取舍（已定，供审阅）
 
@@ -161,11 +162,11 @@ Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，下一步 P
 | P1 | Trojan | TLS 证书来自 CertConfig |
 | P2 | Shadowsocks | 含 SS2022 多用户（`ServerKey` + 用户 PSK）；面板配了 obfs=http 时节点启动报错，不静默降级 |
 | P3 | Hysteria2 | 从 Xray 移回 sing-box；obfs、带宽沿用旧 sing-box 实现。version 不是 2 时直接拒绝（现在的 sing-box 代码遇到 version 为 0 会按 Hysteria 1 启动） |
-| P4 | VMess / VLESS | tcp / ws / grpc / httpupgrade；VLESS flow |
+| ~~P4~~ | ~~VMess / VLESS~~ | 取消（决定 5） |
 | P5 | VLESS Reality + Vision | 映射 Reality 字段：`MaxTimeDiff` 的毫秒值要转成 Duration，本地 `REALITYConfigs` / `DisableLocalREALITYConfig` 两条路径都要处理，Reality 节点不要求 CertConfig。按决定 1 放弃的字段遇到时打警告。e2e 测试替代 `reality_smoke_test.go` |
 
 - **P1** Trojan（已完成）：keeper 的 Trojan 节点固定是 tcp + TLS，用户密钥用 UUID（keeper 不给 Trojan 发 Passwd，和 Xray 一致），用户变化热更新不重建。
-  - 其他传输（ws / grpc 等）和 REALITY 节点启动报错，留到 P4 / P5。`EnableFallback` 打警告后忽略（决定 1）；`EnableProxyProtocol` 对所有 sing-box 节点都打警告后忽略。Xray 的 mux.cool 不支持，wkernel 客户端用不上。
+  - 其他传输（ws / grpc 等）和 REALITY 节点启动报错，REALITY 留到 P5（ws / grpc 等不再做，决定 5）。`EnableFallback` 打警告后忽略（决定 1）；`EnableProxyProtocol` 对所有 sing-box 节点都打警告后忽略。Xray 的 mux.cool 不支持，wkernel 客户端用不上。
   - `CertMode: none` 照 Xray 提供明文 Trojan（TLS 由前置代理卸载）；AnyTLS 没有明文形式，仍报错。ALPN 照 Xray 服务端默认协商 `h2, http/1.1`，主动探测看到的 TLS 表现不变。
   - 证书续期：以前 sing-box 控制器不续期，dns / http 模式的证书约 90 天后过期（AnyTLS 节点一直有这个问题）。现在和 Xray 一样每 60×`UpdatePeriodic` 秒调一次续期，新文件由 sing-box 重载；Hysteria 节点续期成功后重建 box。
   - wkernel 的证书重载有竞争：证书和私钥两个回调并发执行，两边都可能配出"新证书 + 旧私钥"，重载失败后旧证书一直用到过期。已在 wkernel `65c53531` 修复（本地提交，未推送）；XrayR 升级到含该提交的版本之前续期仍可能不生效，`TestTrojanNodeReloadsCertificate` 也先跳过，升级时去掉跳过。
@@ -185,6 +186,14 @@ Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，下一步 P
     - 回归用例：fork 里的 `TestCongestionFor`；XrayR 的 `TestHysteria2NodeWithoutBandwidthStaysOnBBR`（客户端声明 1 Mbps 下行，回显 512 KiB：fork 下毫秒级，上游被 Brutal 限速要约 10s），replace 丢了它就会失败。
     - 和 Xray 仍有的差异：客户端没声明下行带宽时，Xray 照样回 `CC-RX: <服务端下行>`（为 0 时客户端上传用自己的 Brutal），sing-quic 回 `auto`，客户端上传改用 BBR。单位上 Xray 的 "N mbps" 是 N×1024×1024/8 B/s，sing-box 是 N×125000 B/s，同一个面板值低约 4.6%。
   - 上线后 sing-quic 用户表的数据竞争（见风险）进入生产：amd64 实际不出错，上 arm64 前必须修。
+- **P5** VLESS REALITY + Vision（已完成）：NodeType 为 Vless，或 V2ray 且开了 EnableVless 的节点改走 sing-box；VMess 节点留在 Xray，删 Xray 时一起去掉（决定 5）。
+  - 只服务 tcp（照 Xray 也认 `raw`，不分大小写）+ REALITY，flow 为空或 `xtls-rprx-vision`；不带 REALITY 的 VLESS、其他传输、其他 flow、tcp 的 HTTP 伪装头（Xray 能叠在 REALITY 上；照 Xray，header 的 type 不分大小写，只有 none 能启动，缺 type 也报错）都启动报错。keeper 读的是 `network_settings`，面板只发 `networkSettings`，所以 VLESS 节点现在收不到 header（Path / Host 同理，迁移前就这样）。用户密钥是 UUID（规范化后判重），用户变化热更新不重建。
+  - 和 Xray 的差异：非 UUID 的用户 id 一律映射成 UUIDv5，Xray 只映射 1–30 个字符的、更长的拒绝；用户 flow 是 Vision 时，客户端不带 flow 的 UDP / XUDP 请求被 sing-vmess 拒绝，Xray 放行。Xray、wkernel、mihomo 的客户端 UDP 都会带上 flow，只影响老的第三方客户端。
+  - REALITY 配置照 Xray 选来源：`DisableLocalREALITYConfig`，或面板标了 REALITY（tls 2）而本地没配 `REALITYConfigs` 时用面板的；否则本地 `EnableREALITY` 且配了 `REALITYConfigs` 时用本地的。REALITY 节点不申请、不续期证书。
+  - 映射：Dest 支持 `host:port` 和纯端口（= `localhost:端口`），unix socket 不支持；`MaxTimeDiff` 毫秒转 Duration；只服务第一个 ServerName，多的打警告（决定 1）；`Show`、`MinClientVer` / `MaxClientVer`、`Mldsa65Seed`、`LimitFallback*` 打警告后忽略。
+  - 两处报错而不是警告：`Xver`（PROXY protocol）不为 0——REALITY 每个连接都要先和目标握手，目标要的 PROXY 头发不出去，节点等于不能用；shortId 超过 16 个十六进制字符——sing-box 解码时越界 panic，会带崩整个进程。
+  - e2e（`vless_e2e_test.go`，wkernel 的 REALITY 客户端 + Vision）替代了 Xray 的 `reality_smoke_test.go`：TCP / XUDP 代理和计量、内层 TLS 经 Vision 的计量（这时确实切到了直通，但用例不断言这一点）、错误 UUID / shortId / flow 被拒、探测者看到目标站证书、热更新、REALITY 配置来源的三种优先级、Dest 写域名或纯端口、不支持配置拒绝启动。
+  - Vision 直通后 Linux 上可能走 splice 零拷贝，macOS 的 e2e 只覆盖到用户态拷贝：灰度时重点核对 Vision 节点的流量上报和限速。
 
 每步都要验证：e2e 测试通过；灰度服务器的流量上报、在线 IP、限速和 Xray 时期一致；CPU 和吞吐不明显变差。
 
@@ -209,6 +218,7 @@ Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，下一步 P
 - ~~S3 实测：限速包装会不会被 splice / 零拷贝绕过。~~ S3b 已核对，不会（见 S3b）。
 - hysteria2 的热更新依赖 sing-quic 的 `UpdateUsers`，它发布用户表时没有同步，是数据竞争。现在镜像只构建 amd64，实际不会出错。上 arm64 之前，必须先在 sing-quic 里改成原子存储。`TestHysteria2NodeReplacesUsers` 在 race 构建下自动跳过。
 - sing-snell v6 的数据竞争（上游，S4 的测试暴露）：连接在服务端第一次回复前关闭时，`CloseWrite` 在锁内写 `session.writer`，另一个拷贝方向的 `FrontHeadroom` 不加锁读它。远端没回包就断开的 Snell UDP / UoT 连接都会碰到，`TestSingBoxNodeBlocksPrivateAndBitTorrent` 在 `-race` 下基本每次都会报出，race 构建下自动跳过（`raceEnabled`）。根治要在 sing-snell 里给 `FrontHeadroom` 加锁或改成原子读。
+- sing-vmess Vision 用 uintptr 偏移读 TLS 连接的内部字段，`-race` 自带的 checkptr 会直接 fatal（生产构建不开 checkptr，不受影响）。用到 Vision 的 e2e 在 race 构建下自动跳过；要覆盖时加 `-gcflags=all=-d=checkptr=0` 并临时去掉跳过（2026-10-30 这样跑过 5 遍，没有数据竞争）。
 - 升级 wkernel 时，要核对 XrayR 实际选中的依赖版本和 wkernel 的 go.mod 一致（对比两边的 `go list -m all`）。XrayR 自己的 require 会把 wkernel 要求的版本换掉，伪版本对正式版时，选中的可能反而是更旧的代码（P2 的 sing-shadowsocks 就是这样）。
 - sing-shadowsocks 的数据竞争（上游）：SS2022 服务端连接用无锁的双重检查读 `c.writer`，客户端在服务端第一次回包前断开时，`Close` 和首次写并发，`-race` 会报。被竞争的是一个指针，最坏情况只是 `Close` 漏关 writer，底层连接照样会关。上游 sing-box 的每个 SS2022 入站都有这个问题，不 fork 修，测试里先等回显再关连接来避开。
 - 热更新会重建 snell 服务，两个副作用：

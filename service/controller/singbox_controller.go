@@ -3,9 +3,12 @@ package controller
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"net/netip"
 	"reflect"
 	"slices"
@@ -14,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gofrs/uuid/v5"
 	sb "github.com/sagernet/sing-box"
 	sbadapter "github.com/sagernet/sing-box/adapter"
 	sbcertificate "github.com/sagernet/sing-box/adapter/certificate"
@@ -30,6 +34,7 @@ import (
 	sbshadowsocks "github.com/sagernet/sing-box/protocol/shadowsocks"
 	sbsnell "github.com/sagernet/sing-box/protocol/snell"
 	sbtrojan "github.com/sagernet/sing-box/protocol/trojan"
+	sbvless "github.com/sagernet/sing-box/protocol/vless"
 	"github.com/sagernet/sing/common/json/badoption"
 	N "github.com/sagernet/sing/common/network"
 	log "github.com/sirupsen/logrus"
@@ -375,7 +380,7 @@ func (c *SingBoxController) updateInboundUsers(nodeInfo *api.NodeInfo, tag strin
 	if !loaded {
 		return fmt.Errorf("inbound %s not found", tag)
 	}
-	switch strings.ToLower(nodeInfo.NodeType) {
+	switch sbNodeType(nodeInfo) {
 	case "anytls":
 		return replaceUsers(inbound, inboundUsers(names, secrets, anytlsUser))
 	case "hysteria":
@@ -384,6 +389,8 @@ func (c *SingBoxController) updateInboundUsers(nodeInfo *api.NodeInfo, tag strin
 		return replaceUsers(inbound, inboundUsers(names, secrets, snellUser))
 	case "trojan":
 		return replaceUsers(inbound, inboundUsers(names, secrets, trojanUser))
+	case "vless":
+		return replaceUsers(inbound, inboundUsers(names, secrets, vlessUser(nodeInfo.VlessFlow)))
 	case "shadowsocks":
 		managed, ok := inbound.(sbadapter.ManagedSSMServer)
 		if !ok {
@@ -557,8 +564,19 @@ func userSecret(user *api.UserInfo) string {
 
 // nodeSecret returns how the node turns a user's secret into its key. A
 // Shadowsocks 2022 user key is the password (keeper's is the uuid) cut to the
-// key size and base64 encoded, the derivation Xray used for keeper.
+// key size and base64 encoded, the derivation Xray used for keeper. A VLESS
+// id is the uuid in canonical form, so two spellings of one uuid count as a
+// shared secret; sing-vmess, like Xray, maps any other string to a UUIDv5.
 func nodeSecret(nodeInfo *api.NodeInfo) func(secret string) (string, error) {
+	if sbNodeType(nodeInfo) == "vless" {
+		return func(secret string) (string, error) {
+			id, err := uuid.FromString(secret)
+			if err != nil {
+				id = uuid.NewV5(uuid.Nil, secret)
+			}
+			return id.String(), nil
+		}
+	}
 	keySize := 0
 	if strings.EqualFold(nodeInfo.NodeType, "shadowsocks") {
 		keySize = ss2022KeySize(ssMethod(nodeInfo))
@@ -572,6 +590,102 @@ func nodeSecret(nodeInfo *api.NodeInfo) func(secret string) (string, error) {
 		}
 		return base64.StdEncoding.EncodeToString([]byte(secret[:keySize])), nil
 	}
+}
+
+// realityConfig picks the node's REALITY settings as Xray did: the panel's
+// when DisableLocalREALITYConfig forces them or the panel marks the node
+// REALITY with no local settings, otherwise the local ones when EnableREALITY
+// is on. nil means the node is not REALITY.
+func realityConfig(nodeInfo *api.NodeInfo, config *Config) *api.REALITYConfig {
+	if config.DisableLocalREALITYConfig || nodeInfo.EnableREALITY && config.REALITYConfigs == nil {
+		if nodeInfo.EnableREALITY {
+			return nodeInfo.REALITYConfig
+		}
+		return nil
+	}
+	if !config.EnableREALITY || config.REALITYConfigs == nil {
+		return nil
+	}
+	local := config.REALITYConfigs
+	return &api.REALITYConfig{
+		Dest:                  local.Dest,
+		ProxyProtocolVer:      local.ProxyProtocolVer,
+		ServerNames:           local.ServerNames,
+		PrivateKey:            local.PrivateKey,
+		MinClientVer:          local.MinClientVer,
+		MaxClientVer:          local.MaxClientVer,
+		MaxTimeDiff:           local.MaxTimeDiff,
+		ShortIds:              local.ShortIds,
+		Show:                  local.Show,
+		Mldsa65Seed:           local.Mldsa65Seed,
+		LimitFallbackUpload:   api.LimitFallback(local.LimitFallbackUpload),
+		LimitFallbackDownload: api.LimitFallback(local.LimitFallbackDownload),
+	}
+}
+
+// realityTLSOptions maps Xray's REALITY settings to sing-box's. The fields
+// sing-box lacks were given up (decision 1) and only draw a warning, except
+// a PROXY protocol version: without it the handshake target refuses every
+// connection, so the node fails to start instead.
+func (c *SingBoxController) realityTLSOptions(r *api.REALITYConfig) (*sboption.InboundTLSOptions, error) {
+	if r.ProxyProtocolVer != 0 {
+		return nil, errors.New("reality: PROXY protocol to the target (xver) is not supported on sing-box nodes")
+	}
+	dest := r.Dest
+	if _, err := strconv.Atoi(dest); err == nil {
+		dest = "localhost:" + dest
+	}
+	host, portString, err := net.SplitHostPort(dest)
+	if err != nil {
+		return nil, fmt.Errorf("reality: invalid target %q", r.Dest)
+	}
+	port, err := strconv.ParseUint(portString, 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("reality: invalid target %q", r.Dest)
+	}
+	if len(r.ServerNames) == 0 {
+		return nil, errors.New("reality: no server name")
+	}
+	if len(r.ServerNames) > 1 {
+		c.logger.Warnf("reality: sing-box accepts one server name, only %q is served", r.ServerNames[0])
+	}
+	if len(r.ShortIds) == 0 {
+		return nil, errors.New("reality: no short id")
+	}
+	for _, shortID := range r.ShortIds {
+		// sing-box decodes into 8 bytes and panics on a longer one.
+		if _, err := hex.DecodeString(shortID); err != nil || len(shortID) > 16 {
+			return nil, fmt.Errorf("reality: invalid short id %q", shortID)
+		}
+	}
+	for _, ignored := range []struct {
+		field string
+		set   bool
+	}{
+		{"Show", r.Show},
+		{"MinClientVer", r.MinClientVer != ""},
+		{"MaxClientVer", r.MaxClientVer != ""},
+		{"Mldsa65Seed", r.Mldsa65Seed != ""},
+		{"LimitFallbackUpload", r.LimitFallbackUpload != api.LimitFallback{}},
+		{"LimitFallbackDownload", r.LimitFallbackDownload != api.LimitFallback{}},
+	} {
+		if ignored.set {
+			c.logger.Warnf("reality: %s is not supported on sing-box nodes and is ignored", ignored.field)
+		}
+	}
+	return &sboption.InboundTLSOptions{
+		Enabled:    true,
+		ServerName: r.ServerNames[0],
+		Reality: &sboption.InboundRealityOptions{
+			Enabled: true,
+			Handshake: sboption.InboundRealityHandshakeOptions{
+				ServerOptions: sboption.ServerOptions{Server: host, ServerPort: uint16(port)},
+			},
+			PrivateKey:        r.PrivateKey,
+			ShortID:           badoption.Listable[string](r.ShortIds),
+			MaxTimeDifference: badoption.Duration(time.Duration(r.MaxTimeDiff) * time.Millisecond),
+		},
+	}, nil
 }
 
 func ssMethod(nodeInfo *api.NodeInfo) string {
@@ -609,6 +723,12 @@ func trojanUser(name, secret string) sboption.TrojanUser {
 	return sboption.TrojanUser{Name: name, Password: secret}
 }
 
+func vlessUser(flow string) func(name, secret string) sboption.VLESSUser {
+	return func(name, secret string) sboption.VLESSUser {
+		return sboption.VLESSUser{Name: name, UUID: secret, Flow: flow}
+	}
+}
+
 func ssUser(name, secret string) sboption.ShadowsocksUser {
 	return sboption.ShadowsocksUser{Name: name, Password: secret}
 }
@@ -617,12 +737,22 @@ func snellUser(name, secret string) sboption.SnellUser {
 	return sboption.SnellUser{Name: name, UserKey: secret}
 }
 
+// sbNodeType names the node's protocol: keeper's VLESS node is NodeType Vless,
+// or V2ray with EnableVless.
+func sbNodeType(nodeInfo *api.NodeInfo) string {
+	nodeType := strings.ToLower(nodeInfo.NodeType)
+	if (nodeType == "v2ray" || nodeType == "vless") && nodeInfo.EnableVless {
+		return "vless"
+	}
+	return nodeType
+}
+
 // newBox builds a box for the node without starting it, so nothing listens
 // yet.
 func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, secrets []string) (*sb.Box, error) {
-	nodeType := strings.ToLower(nodeInfo.NodeType)
+	nodeType := sbNodeType(nodeInfo)
 	switch nodeType {
-	case "anytls", "hysteria", "shadowsocks", "snell", "trojan":
+	case "anytls", "hysteria", "shadowsocks", "snell", "trojan", "vless":
 	default:
 		return nil, fmt.Errorf("unsupported node type for sing-box controller: %s", nodeInfo.NodeType)
 	}
@@ -650,7 +780,8 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 	// proxy that terminates TLS; AnyTLS has no plain form.
 	plainTrojan := nodeType == "trojan" && c.config.CertConfig != nil && c.config.CertConfig.CertMode == "none"
 	var tlsOptions *sboption.InboundTLSOptions
-	if nodeInfo.EnableTLS && !plainTrojan {
+	// A VLESS node's TLS is REALITY, which takes no certificate.
+	if nodeInfo.EnableTLS && !plainTrojan && nodeType != "vless" {
 		if c.config.CertConfig == nil || c.config.CertConfig.CertMode == "none" {
 			return nil, fmt.Errorf("tls is required but CertConfig is not configured")
 		}
@@ -737,6 +868,51 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 				TLS: tlsOptions,
 			},
 			Users: inboundUsers(names, secrets, trojanUser),
+		}
+	case "vless":
+		// VMess and VLESS without REALITY are not migrated
+		// (docs/plans/sing-box-migration.md, decision 5).
+		// Xray takes raw as tcp, in any case.
+		switch strings.ToLower(nodeInfo.TransportProtocol) {
+		case "tcp", "raw":
+		default:
+			return nil, fmt.Errorf("vless: unsupported transport %q", nodeInfo.TransportProtocol)
+		}
+		// Xray layered an http header over REALITY, which sing-box cannot. As
+		// on Xray, a header must name its type, in any case, and only none
+		// starts. keeper sends VLESS nodes no header today.
+		if len(nodeInfo.Header) > 0 {
+			var header struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(nodeInfo.Header, &header); err != nil || !strings.EqualFold(header.Type, "none") {
+				return nil, fmt.Errorf("vless: tcp header %s is not supported on sing-box nodes", nodeInfo.Header)
+			}
+		}
+		reality := realityConfig(nodeInfo, c.config)
+		if reality == nil {
+			return nil, errors.New("vless: only REALITY nodes are supported on sing-box")
+		}
+		switch nodeInfo.VlessFlow {
+		case "", "xtls-rprx-vision":
+		default:
+			return nil, fmt.Errorf("vless: unsupported flow %q", nodeInfo.VlessFlow)
+		}
+		if c.config.EnableFallback {
+			c.logger.Warn("vless: EnableFallback is not supported on sing-box nodes and is ignored")
+		}
+		realityTLS, err := c.realityTLSOptions(reality)
+		if err != nil {
+			return nil, err
+		}
+		sbvless.RegisterInbound(inReg)
+		inboundType = sbc.TypeVLESS
+		inboundOptions = &sboption.VLESSInboundOptions{
+			ListenOptions: lo,
+			InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
+				TLS: realityTLS,
+			},
+			Users: inboundUsers(names, secrets, vlessUser(nodeInfo.VlessFlow)),
 		}
 	case "shadowsocks":
 		// keeper sends obfs=http as a TCP header; sing-box has no server side
@@ -1007,7 +1183,7 @@ func actionRule(match sboption.RawDefaultRule, action sboption.RuleAction) sbopt
 // the rewritten files by themselves; QUIC needs a rebuild.
 func (c *SingBoxController) certMonitor() error {
 	c.access.Lock()
-	enableTLS := c.nodeInfo.EnableTLS
+	enableTLS := c.nodeInfo.EnableTLS && sbNodeType(c.nodeInfo) != "vless"
 	c.access.Unlock()
 	if !enableTLS || c.config.CertConfig == nil {
 		return nil
