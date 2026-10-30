@@ -1,6 +1,6 @@
 # 主内核从 Xray-core 迁到 sing-box（wkernel）
 
-Status: 已定，实施中（W1、W2、S1、S2 已完成，下一步 S3）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
+Status: 已定，实施中（W1、W2、S1、S2、S3 已完成，下一步 S4）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
 
 ## 背景与目标
 
@@ -121,17 +121,21 @@ Status: 已定，实施中（W1、W2、S1、S2 已完成，下一步 S3）。架
   - 跨节点设备数（Redis，`GlobalDeviceLimitConfig`）从 `common/limiter` 抽成 `GlobalLimiter`，两套控制器共用，key 格式不变（`设备数|email|uid`），所以 Xray 节点和 sing-box 节点按同一份名单计数。sing-box 侧只在设了设备数时才访问 Redis。缓存出错的日志改走 logrus。顺手修了上游的计数 bug（Xray 节点也受益）：原来先判断 `已有 IP 数 > 设备数` 再加入，会多放进一台设备，之后连已有设备也全部被拒，直到 key 过期；现在已知 IP 总是放行，新 IP 在 `已有 IP 数 >= 设备数` 时被拒（`TestAddDevice`）。Xray 侧被全局检查拒掉的新 IP 也从本地在线名单里删掉，不再占本地名额、不再被上报在线（原来只有本地拒绝才删；这一处没有单测，Redis 部分需要真实 Redis）。
   - 已知未修（上游原样，概率低）：写 Redis 是异步的整表覆盖，两台新设备同时上线会丢掉一个；sing-box 侧写入 Redis 后，如果本地复查时用户刚被删或名额被抢，这个 IP 会在 Redis 里白占一个名额直到过期。
   - 限速：每个 UID 一个令牌桶，上下行共用，容量为一秒的量（和 Xray 一样）。一次读写超过桶容量时分段等待：`WaitN` 遇到超过容量的请求会直接报错，Xray 的实现在这种情况下会放过整块数据不限速。
-  - 只有建连时有限速的用户才包装连接，没限速的用户走原来的拷贝路径。包装层转发 `CloseWrite`（和拷贝一样先越过下面的流量计数层），不把半关闭变成全关闭（snell v5 靠它告诉客户端目标为什么断开；`TestRateConnHalfCloses`）。限速被取消时，令牌桶改成不限，已有连接立即生效；没限速的用户新加了限速，只对新连接生效（Xray 也是这样）。自动限速要对已有连接生效，留给 S3d 处理。
-  - 留给 S3d：超设备数时每条被拒的流都打一条 Warn，客户端重试会刷屏，降级日志时改成限频；限速等待中的连接关闭后要等这段等待结束才释放（有界，不会卡死）。
+  - 只有建连时有限速的用户才包装连接，没限速的用户走原来的拷贝路径。包装层转发 `CloseWrite`（和拷贝一样先越过下面的流量计数层），不把半关闭变成全关闭（snell v5 靠它告诉客户端目标为什么断开；`TestRateConnHalfCloses`）。限速被取消时，令牌桶改成不限，已有连接立即生效；没限速的用户新加了限速，S3d 起会断开他未包装的现有连接（见 S3d）。
+  - 已知未修：限速等待中的连接关闭后要等这段等待结束才释放（有界，不会卡死）。
   - 已核对：sing 的拷贝只在包装层声明可替换时才拆包装，splice 只用于 TUN，所以限速包装不会被零拷贝绕过（第 4 节的待实测项已有结论）。
 
   S3c 已完成（回归用例 `TestSingBoxNodeAudits`、`TestAuditTargets`、keeper 的 `TestCompileRuleSkipsWhatBreaksTheNode`）：
   - 默认路由加一条无条件的 sniff 规则，`DisableSniffing` 关掉，和 Xray 节点默认开 sniff 一致（原定在 S4 做，审计依赖它，提前到这里）。sniff 只填 `metadata.Domain`，不改拨号目标。代价：服务器先发数据的协议（SSH 等）和不带换行的首包建连时最多多等 sniff 超时（300ms），Xray 节点同样如此。wkernel 对邮件端口（25/465/587/143/993/110/995）跳过 sniff，所以这些端口上的 TLS 只能按 IP 审计，Xray 会 sniff。
   - 匹配串整体转小写：Xray 的 HTTP sniff 会把 Host 转小写，sing 不会，大写 Host 会绕过规则；面板规则按小写写。UDP over TCP（AnyTLS 的 UDP 都走它）在 `metadata.Domain` 里留的是魔法域名 `sp.v2.udp-over-tcp.arpa`，审计时忽略它，按真实目标匹配。旧版 UoT（`sp.udp-over-tcp.arpa`）的目标逐包携带，连接上只有 `0.0.0.0:0`，和 XUDP 一样审计不到。这两点由 `TestAuditTargets` 覆盖；UoT 没有 e2e（snell v6 + UoT 会让进程崩溃，是 wkernel 侧的已有问题，另行处理）。
   - 拨号地址和 sniff 到的域名各生成一个匹配串，任一命中就拒绝。Xray 会改成按 sniff 到的域名拨号，一个串就够；sing 仍拨原地址，只看域名的话，客户端用允许的 SNI / Host 就能连被封的地址。代价是比 Xray 严：封了某个 IP，经这个 IP 访问允许的域名也会被拒。
-  - 审计在 guard 里、设备数检查之前做，对所有连接生效（包括没有用户的 shared-psk snell）。命中只拒绝并打 Warn 日志，不记录违规：keeper 的违规上报是空实现（见上）。每次命中一条 Warn，和设备数拒绝一样留给 S3d 限频。
+  - 审计在 guard 里、设备数检查之前做，对所有连接生效（包括没有用户的 shared-psk snell）。命中只拒绝并打 Warn 日志，不记录违规：keeper 的违规上报是空实现（见上）。命中的 Warn 由 S3d 限频（见 S3d）。
   - 规则每个拉取周期在拉完节点信息后拉一次（keeper 从节点信息里取规则），`DisableGetRule` 关掉。面板清空规则时节点上的规则也清空；Xray 侧原来只在规则非空时更新，删光规则后旧规则一直生效，一并修了。
   - keeper 顺手修（Xray 节点也受益）：面板或本地规则文件里的正则写错会让进程 panic，空规则或空的备选项（比如没填匹配项的 block 路由、匹配项里有空串时拼出的 `a.com|`、规则文件里的空行）会匹配所有目标、拒绝全部流量，现在逐项包成 `(?:…)` 编译（避免 `(?i)`、未闭合的 `\Q` 影响其他项），写错的项和能匹配空串的项（空白、`.*`、`^`、`foo|` 等）单独去掉并打日志，同一条路由里其余的项照常生效（写错的项每次拉取都会报一次，直到面板改好）；规则 ID 改用面板路由的 id，原来是它在列表里的下标；本地规则列表不再被每次拉取的 append 共用底层数组。
+  S3d 已完成（回归用例 `TestSingBoxNodeAutoLimitsFastUsers`、`TestAutoSpeedLimit`、`TestGuardCutsUnlimitedConnectionsOnNewLimit`、`TestGuardThrottlesRejectionLogs`）：
+  - 自动限速沿用 `AutoSpeedLimitConfig`，语义同 Xray：一次上报里上行或下行超过 `Limit`，连续超过 `WarnTimes` 次后限到 `LimitSpeed`，`LimitDuration` 分钟后恢复；`Limit` 或 `LimitSpeed` 为 0 时不启用。和 Xray 的不同：速率按实际计入的时长算（Xray 按 `UpdatePeriodic` 算，上报抖动和上报失败都会算偏）；状态按 UID 记（Xray 按整个用户信息记，面板改了用户任何字段就丢状态）；自动限速和面板限速取更严的（Xray 直接覆盖，可能把更严的面板限速放宽）。限住和恢复各打一条 Info。已知偏差：面板上报失败时计数不清零，下一次按更长的时长重算同一批流量，"连续超限"的次数会算上重叠的数据（Xray 按固定周期算累计流量，偏得更多）。
+  - 用户从不限速变成限速（自动限速、面板新加限速、节点新加限速）时，guard 断开他未包装的现有连接，客户端重连后就受限：未包装的连接没法事后限速。代价：被限的用户掉线重连一次；节点新加限速时全节点重连一次。已在令牌桶里的连接只改速率，不断开。
+  - 日志：每条连接、每个用户每次的流量日志降到 Debug，UDP 日志里写死的 "AnyTLS" 改成实际入站类型；超设备数的 Warn 每个 UID 每分钟最多一条（本节点和跨节点共用一个名额），审计命中的 Warn 每个 UID 每条规则每分钟最多一条；限频用独立的锁，不占 guard 的主锁；已删除用户被拒只打 Debug。
 - **S4** 出站和日志：`SendIP`、`DNSType`、日志级别和错误日志映射（现在 sing-box 控制器把日志整个关掉了）；默认屏蔽私有 IP 和 BT（决定 2）。BT 识别依赖 sniff（S3c 已开）。
 
 完成后 AnyTLS 和 Snell 节点的功能与 Xray 节点持平。部署一台服务器自用验证，再全量。

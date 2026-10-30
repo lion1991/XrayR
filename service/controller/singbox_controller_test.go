@@ -326,3 +326,97 @@ func TestTrafficMonitorMergesNamesOfOneUID(t *testing.T) {
 		t.Fatal("reported traffic was not subtracted from the counters")
 	}
 }
+
+func TestAutoSpeedLimit(t *testing.T) {
+	a := newAutoSpeedLimit(&AutoSpeedLimitConfig{Limit: 10, WarnTimes: 1, LimitSpeed: 2, LimitDuration: 1}, log.NewEntry(log.StandardLogger()))
+	start := time.Now()
+	period := 10 * time.Second
+	fast := api.UserTraffic{UID: 1, Download: 20e6} // 2 MB/s, over 10 Mbps
+	slow := api.UserTraffic{UID: 2, Upload: 1e6}
+	tick := func(n int, traffic ...api.UserTraffic) (map[int]uint64, bool) {
+		return a.observe(start.Add(time.Duration(n)*period), period, traffic)
+	}
+	if _, changed := tick(1, fast, slow); changed {
+		t.Fatal("limited at the first warning, WarnTimes is 1")
+	}
+	if _, changed := tick(2, slow); changed {
+		t.Fatal("limited after a slow report")
+	}
+	tick(3, fast)
+	limits, changed := tick(4, fast, slow)
+	if !changed || !reflect.DeepEqual(limits, map[int]uint64{1: 250000}) {
+		t.Fatalf("limits = %v, changed %v after two fast reports in a row, want uid 1 at 2 Mbps", limits, changed)
+	}
+	if _, changed := tick(5, fast); changed {
+		t.Fatal("a limited user was limited again")
+	}
+	// The speed is measured over the time counted, not the nominal period.
+	if a.observe(start.Add(6*period), 100*time.Second, []api.UserTraffic{{UID: 3, Download: 20e6}}); a.warned[3] != 0 {
+		t.Fatal("measured a long period as a short one")
+	}
+	if limits, changed := tick(12, slow); !changed || len(limits) != 0 {
+		t.Fatalf("limits = %v, changed %v after the minute, want lifted", limits, changed)
+	}
+	if newAutoSpeedLimit(&AutoSpeedLimitConfig{Limit: 10}, nil) != nil || newAutoSpeedLimit(nil, nil) != nil {
+		t.Fatal("auto limiting on without a limit speed or config")
+	}
+}
+
+// A connection opened unlimited cannot be slowed down, so it is cut once its
+// user gets a limit; connections in the user's bucket just follow the rate.
+func TestGuardCutsUnlimitedConnectionsOnNewLimit(t *testing.T) {
+	g := testGuard()
+	users := []api.UserInfo{{UID: 1}, {UID: 2}, {UID: 3, SpeedLimit: 1000}}
+	var names []string
+	for i := range users {
+		names = append(names, userTag("n", &users[i], 0))
+	}
+	g.admitOnly(names)
+	g.setPolicies(0, users)
+	open := make([]*closeRecorder, len(users))
+	buckets := make([]*rate.Limiter, len(users))
+	for i := range users {
+		open[i] = &closeRecorder{}
+		_, buckets[i], _ = g.admit(names[i], testIP, open[i])
+	}
+
+	g.setAutoLimits(map[int]uint64{1: 500, 3: 2000})
+	if !open[0].closed.Load() {
+		t.Fatal("an unlimited connection kept going after its user was auto limited")
+	}
+	if open[1].closed.Load() || open[2].closed.Load() {
+		t.Fatal("cut a user without a new limit, or one already in a bucket")
+	}
+	if buckets[2].Limit() != 1000 {
+		t.Fatalf("limit = %v, auto limiting loosened the panel's 1000", buckets[2].Limit())
+	}
+	if _, bucket, _ := g.admit(names[0], testIP, &closeRecorder{}); bucket == nil || bucket.Limit() != 500 {
+		t.Fatal("a new connection of the auto limited user is not limited")
+	}
+
+	// The panel giving a limit cuts the same way.
+	users[1].SpeedLimit = 3000
+	g.setPolicies(0, users)
+	if !open[1].closed.Load() {
+		t.Fatal("an unlimited connection kept going after the panel limited its user")
+	}
+	g.setAutoLimits(nil)
+	if buckets[2].Limit() != 1000 {
+		t.Fatal("lifting the auto limit did not restore the panel's")
+	}
+}
+
+// A client retrying against a limit gets one log line per reason a minute.
+func TestGuardThrottlesRejectionLogs(t *testing.T) {
+	g := testGuard()
+	if !g.shouldLog("device|1") || g.shouldLog("device|1") {
+		t.Fatal("logged a repeated rejection, or not the first")
+	}
+	if !g.shouldLog("device|2") || !g.shouldLog("audit|1|7") {
+		t.Fatal("throttled another user's or reason's rejection")
+	}
+	g.rejectLogged["device|1"] = time.Now().Add(-rejectLogEvery)
+	if !g.shouldLog("device|1") {
+		t.Fatal("still throttled after the minute")
+	}
+}

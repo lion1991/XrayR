@@ -52,6 +52,9 @@ type SingBoxController struct {
 	// reported after it.
 	traffic *singBoxTrafficTracker
 	guard   *singBoxGuard
+	// Only the traffic monitor touches these.
+	autoLimit    *autoSpeedLimit // nil when auto limiting is off
+	trafficSince time.Time       // start of the traffic not yet reported
 
 	// access guards everything below; the node monitor, the traffic monitor
 	// and Close run on different goroutines.
@@ -112,6 +115,8 @@ func (c *SingBoxController) Start() error {
 	c.traffic = newSingBoxTrafficTracker(c.logger)
 	c.guard = newSingBoxGuard(c.logger, limiter.NewGlobalLimiter(c.config.GlobalDeviceLimitConfig))
 	c.credentials = make(map[int]credential)
+	c.autoLimit = newAutoSpeedLimit(c.config.AutoSpeedLimitConfig, c.logger)
+	c.trafficSince = time.Now()
 	c.pullRules()
 
 	c.access.Lock()
@@ -800,6 +805,7 @@ func (c *SingBoxController) trafficMonitor() error {
 	byUID := make(map[int]int)
 	var userTraffic []api.UserTraffic
 	var reported []pending
+	now := time.Now()
 	for name, counter := range c.traffic.snapshot() {
 		up, down := counter.up.Load(), counter.down.Load()
 		if up == 0 && down == 0 {
@@ -812,9 +818,7 @@ func (c *SingBoxController) trafficMonitor() error {
 			counter.down.Add(-down)
 			continue
 		}
-		if down > 0 {
-			c.logger.Printf("Traffic counted: tag=%s up=%d down=%d", name, up, down)
-		}
+		c.logger.Debugf("Traffic counted: tag=%s up=%d down=%d", name, up, down)
 		if index, loaded := byUID[uid]; loaded {
 			userTraffic[index].Upload += up
 			userTraffic[index].Download += down
@@ -828,6 +832,11 @@ func (c *SingBoxController) trafficMonitor() error {
 			})
 		}
 		reported = append(reported, pending{counter, up, down})
+	}
+	if c.autoLimit != nil {
+		if limits, changed := c.autoLimit.observe(now, now.Sub(c.trafficSince), userTraffic); changed {
+			c.guard.setAutoLimits(limits)
+		}
 	}
 
 	if len(userTraffic) > 0 {
@@ -844,5 +853,6 @@ func (c *SingBoxController) trafficMonitor() error {
 			p.counter.down.Add(-p.down)
 		}
 	}
+	c.trafficSince = now
 	return nil
 }

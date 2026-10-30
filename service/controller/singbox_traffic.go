@@ -46,7 +46,7 @@ func (t *singBoxTrafficTracker) RoutedConnection(ctx context.Context, conn net.C
 			"source":   metadata.Source.String(),
 			"dest":     metadata.Destination.String(),
 			"outbound": outboundTag,
-		}).Infof("%s connection", metadata.InboundType)
+		}).Debugf("%s connection", metadata.InboundType)
 	}
 	counter := t.counter(user)
 	return singbufio.NewInt64CounterConn(conn, []*atomic.Int64{&counter.up}, []*atomic.Int64{&counter.down})
@@ -77,7 +77,7 @@ func (t *singBoxTrafficTracker) RoutedPacketConnection(ctx context.Context, conn
 			"source":   metadata.Source.String(),
 			"dest":     metadata.Destination.String(),
 			"outbound": outboundTag,
-		}).Info("AnyTLS packet connection")
+		}).Debugf("%s packet connection", metadata.InboundType)
 	}
 	counter := t.counter(user)
 	return singbufio.NewInt64CounterPacketConn(conn, []*atomic.Int64{&counter.up}, nil, []*atomic.Int64{&counter.down}, nil)

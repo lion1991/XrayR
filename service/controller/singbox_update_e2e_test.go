@@ -350,3 +350,70 @@ func TestSingBoxNodeAudits(t *testing.T) {
 		return proxies(t, nodeAddr, snellTestUUID, blockedIP)
 	})
 }
+
+// A user going over the auto limit is slowed down, including the connection
+// that was open when the limit came: it is cut so the client reconnects
+// limited. Others run free.
+func TestSingBoxNodeAutoLimitsFastUsers(t *testing.T) {
+	echo := startEchoServer(t)
+	port := freePort(t)
+	nodeAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	f := &fakeSnellAPI{
+		nodeInfo: &api.NodeInfo{
+			NodeType:       "Snell",
+			NodeID:         1,
+			Port:           uint32(port),
+			SnellVersion:   6,
+			SnellPSK:       snellTestPSK,
+			SnellMultiUser: true,
+		},
+		users: []api.UserInfo{
+			{UID: 42, UUID: snellTestUUID, Email: "a@test"},
+			{UID: 43, UUID: snellTestUUID2, Email: "b@test"},
+		},
+	}
+	c := NewSingBoxController(f, &Config{
+		ListenIP:       "127.0.0.1",
+		UpdatePeriodic: 1,
+		// 1 Mbps is 125000 bytes per second.
+		AutoSpeedLimitConfig: &AutoSpeedLimitConfig{Limit: 1, LimitSpeed: 1, LimitDuration: 1},
+	}, "Keeper")
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	fast, err := snellDial(t, nodeAddr, snellTestUUID, echo)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer fast.Close()
+	burst := string(make([]byte, 1<<20))
+	if got, err := echoThroughWithin(fast, burst, 5*time.Second); err != nil || got != burst {
+		t.Fatalf("echo before the limit: %v", err)
+	}
+	waitFor(t, "the open connection of the limited user to be cut", func() bool {
+		_, err := echoThrough(fast, "probe")
+		return err != nil
+	})
+
+	payload := string(make([]byte, 125000))
+	timeEcho := func(userKey string) time.Duration {
+		conn, err := snellDial(t, nodeAddr, userKey, echo)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		start := time.Now()
+		if got, err := echoThroughWithin(conn, payload, 10*time.Second); err != nil || got != payload {
+			t.Fatalf("echo %d bytes: %v", len(payload), err)
+		}
+		return time.Since(start)
+	}
+	if elapsed := timeEcho(snellTestUUID); elapsed < 800*time.Millisecond {
+		t.Fatalf("an auto limited user moved %d bytes both ways in %v", len(payload), elapsed)
+	}
+	if elapsed := timeEcho(snellTestUUID2); elapsed > 500*time.Millisecond {
+		t.Fatalf("a user under the limit took %v for the same", elapsed)
+	}
+}

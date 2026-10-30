@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/netip"
 	"slices"
@@ -64,7 +66,13 @@ type singBoxGuard struct {
 
 	nodeSpeedLimit uint64
 	policies       map[int]userPolicy
+	autoLimits     map[int]uint64 // per uid, bytes per second
 	buckets        map[int]*rate.Limiter
+
+	// Its own lock, so a retry storm's logging does not hold up admits.
+	logAccess    sync.Mutex
+	rejectLogged map[string]time.Time // last time a rejection was logged, per key
+	lastPrune    time.Time
 
 	rules atomic.Pointer[[]api.DetectRule]
 }
@@ -75,7 +83,9 @@ type userPolicy struct {
 }
 
 type guardedConn struct {
-	conn io.Closer
+	conn    io.Closer
+	uid     int
+	limited bool // wrapped in the user's bucket
 }
 
 // abort ends the connection both ways. Close alone is not enough: a snell
@@ -91,14 +101,16 @@ func (c *guardedConn) abort() {
 
 func newSingBoxGuard(logger *log.Entry, global *limiter.GlobalLimiter) *singBoxGuard {
 	return &singBoxGuard{
-		logger:   logger,
-		global:   global,
-		allowed:  make(map[string]bool),
-		conns:    make(map[string]map[*guardedConn]struct{}),
-		live:     make(map[int]map[string]int),
-		seen:     make(map[int]map[string]bool),
-		policies: make(map[int]userPolicy),
-		buckets:  make(map[int]*rate.Limiter),
+		logger:       logger,
+		global:       global,
+		allowed:      make(map[string]bool),
+		conns:        make(map[string]map[*guardedConn]struct{}),
+		live:         make(map[int]map[string]int),
+		seen:         make(map[int]map[string]bool),
+		policies:     make(map[int]userPolicy),
+		autoLimits:   make(map[int]uint64),
+		buckets:      make(map[int]*rate.Limiter),
+		rejectLogged: make(map[string]time.Time),
 	}
 }
 
@@ -128,25 +140,60 @@ func (g *singBoxGuard) admitOnly(names ...[]string) {
 	}
 }
 
-// setPolicies takes the limits of the panel's users. A changed speed limit
-// applies to connections already open, as long as the user had a limit when
-// they opened (only those are wrapped).
+// setPolicies takes the limits of the panel's users.
 func (g *singBoxGuard) setPolicies(nodeSpeedLimit uint64, users []api.UserInfo) {
 	policies := make(map[int]userPolicy, len(users))
 	for _, user := range users {
 		policies[user.UID] = userPolicy{speedLimit: user.SpeedLimit, deviceLimit: user.DeviceLimit}
 	}
 	g.access.Lock()
-	defer g.access.Unlock()
 	g.nodeSpeedLimit = nodeSpeedLimit
 	g.policies = policies
+	stale := g.applyRatesLocked()
+	g.access.Unlock()
+	abortAll(stale)
+}
+
+// setAutoLimits replaces the speed limits auto limiting put on users.
+func (g *singBoxGuard) setAutoLimits(limits map[int]uint64) {
+	g.access.Lock()
+	g.autoLimits = maps.Clone(limits)
+	stale := g.applyRatesLocked()
+	g.access.Unlock()
+	abortAll(stale)
+}
+
+// applyRatesLocked brings every bucket to its user's current rate, so a
+// change applies to the connections open in it. A connection opened while
+// its user had no limit is not wrapped and cannot follow; it is returned to
+// be aborted once the user gets one, and the client reconnects limited.
+func (g *singBoxGuard) applyRatesLocked() (stale []*guardedConn) {
 	for uid, bucket := range g.buckets {
-		policy, loaded := policies[uid]
-		if !loaded {
+		if _, listed := g.policies[uid]; !listed {
 			delete(g.buckets, uid)
 			continue
 		}
-		setBucketRate(bucket, effectiveRate(nodeSpeedLimit, policy.speedLimit))
+		setBucketRate(bucket, g.rateLocked(uid))
+	}
+	for _, conns := range g.conns {
+		for conn := range conns {
+			if !conn.limited && g.rateLocked(conn.uid) > 0 {
+				stale = append(stale, conn)
+			}
+		}
+	}
+	return stale
+}
+
+// rateLocked is the user's speed limit in bytes per second, 0 for none: the
+// strictest of the node's, the panel's and auto limiting's.
+func (g *singBoxGuard) rateLocked(uid int) uint64 {
+	return effectiveRate(effectiveRate(g.nodeSpeedLimit, g.policies[uid].speedLimit), g.autoLimits[uid])
+}
+
+func abortAll(conns []*guardedConn) {
+	for _, conn := range conns {
+		conn.abort()
 	}
 }
 
@@ -168,13 +215,14 @@ func (g *singBoxGuard) admit(user string, source netip.Addr, conn io.Closer) (re
 	deviceLimit := g.policies[uid].deviceLimit
 	g.access.Unlock()
 	if err != nil {
+		g.logRejection(uid, deviceLimit, "", err)
 		return nil, nil, err
 	}
 	// The global check talks to Redis, so it runs outside the lock; the
 	// local checks run again below, since the user list may change meanwhile.
 	if g.global != nil && deviceLimit > 0 &&
 		g.global.Reject(limiter.GlobalLimitKey(deviceLimit, email, uid), uid, ip, deviceLimit) {
-		g.logger.Warnf("uid %d reached its device limit (%d) across nodes", uid, deviceLimit)
+		g.logRejection(uid, deviceLimit, " across nodes", errDeviceLimit)
 		return nil, nil, errDeviceLimit
 	}
 
@@ -183,9 +231,17 @@ func (g *singBoxGuard) admit(user string, source netip.Addr, conn io.Closer) (re
 	g.access.Lock()
 	defer g.access.Unlock()
 	if err := g.checkLocked(user, uid, ip); err != nil {
+		g.logRejection(uid, g.policies[uid].deviceLimit, "", err)
 		return nil, nil, err
 	}
-	entry := &guardedConn{conn}
+	if limit := g.rateLocked(uid); limit > 0 {
+		bucket = g.buckets[uid]
+		if bucket == nil {
+			bucket = rate.NewLimiter(rate.Limit(limit), int(limit))
+			g.buckets[uid] = bucket
+		}
+	}
+	entry := &guardedConn{conn: conn, uid: uid, limited: bucket != nil}
 	conns := g.conns[user]
 	if conns == nil {
 		conns = make(map[*guardedConn]struct{})
@@ -203,13 +259,6 @@ func (g *singBoxGuard) admit(user string, source netip.Addr, conn io.Closer) (re
 	}
 	g.seen[uid][ip] = true
 
-	if limit := effectiveRate(g.nodeSpeedLimit, g.policies[uid].speedLimit); limit > 0 {
-		bucket = g.buckets[uid]
-		if bucket == nil {
-			bucket = rate.NewLimiter(rate.Limit(limit), int(limit))
-			g.buckets[uid] = bucket
-		}
-	}
 	return func() {
 		g.access.Lock()
 		defer g.access.Unlock()
@@ -238,10 +287,44 @@ func (g *singBoxGuard) checkLocked(user string, uid int, ip string) error {
 		return nil
 	}
 	if len(g.seen[uid]) >= limit {
-		g.logger.Warnf("uid %d reached its device limit (%d)", uid, limit)
 		return errDeviceLimit
 	}
 	return nil
+}
+
+// rejectLogEvery keeps a client retrying against a limit from flooding the
+// log: one line per uid and reason in this time.
+const rejectLogEvery = time.Minute
+
+func (g *singBoxGuard) logRejection(uid int, deviceLimit int, where string, err error) {
+	switch {
+	case errors.Is(err, errDeviceLimit):
+		if g.shouldLog(fmt.Sprintf("device|%d", uid)) {
+			g.logger.Warnf("uid %d reached its device limit (%d)%s (repeats within %v not logged)", uid, deviceLimit, where, rejectLogEvery)
+		}
+	default:
+		// Removed users' clients keep trying until they learn; nothing to act on.
+		g.logger.Debugf("uid %d: %v", uid, err)
+	}
+}
+
+func (g *singBoxGuard) shouldLog(key string) bool {
+	g.logAccess.Lock()
+	defer g.logAccess.Unlock()
+	now := time.Now()
+	if last, logged := g.rejectLogged[key]; logged && now.Sub(last) < rejectLogEvery {
+		return false
+	}
+	if now.Sub(g.lastPrune) >= rejectLogEvery {
+		for old, last := range g.rejectLogged {
+			if now.Sub(last) >= rejectLogEvery {
+				delete(g.rejectLogged, old)
+			}
+		}
+		g.lastPrune = now
+	}
+	g.rejectLogged[key] = now
+	return true
 }
 
 // onlineUsers lists each user's devices for the online report and starts a
@@ -401,7 +484,9 @@ func (h *guardOutbound) checkAudit(metadata *sbadapter.InboundContext) error {
 		return nil
 	}
 	uid, _, _ := parseUserTag(metadata.User) // 0 for a connection without user
-	h.guard.logger.Warnf("uid %d: access to %s rejected by audit rule %d", uid, target, rule.ID)
+	if h.guard.shouldLog(fmt.Sprintf("audit|%d|%d", uid, rule.ID)) {
+		h.guard.logger.Warnf("uid %d: access to %s rejected by audit rule %d (repeats within %v not logged)", uid, target, rule.ID, rejectLogEvery)
+	}
 	return errAuditRule
 }
 
