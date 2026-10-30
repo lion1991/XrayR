@@ -17,3 +17,6 @@ func (c *SingBoxController) BoxGeneration() int {
 	defer c.access.Unlock()
 	return c.boxGeneration
 }
+
+// ReloadQUICCertificate is what certMonitor runs after a renewal.
+func (c *SingBoxController) ReloadQUICCertificate() { c.reloadQUICCertificate() }

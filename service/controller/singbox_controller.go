@@ -28,6 +28,7 @@ import (
 	sbhysteria "github.com/sagernet/sing-box/protocol/hysteria"
 	sbhysteria2 "github.com/sagernet/sing-box/protocol/hysteria2"
 	sbsnell "github.com/sagernet/sing-box/protocol/snell"
+	sbtrojan "github.com/sagernet/sing-box/protocol/trojan"
 	"github.com/sagernet/sing/common/json/badoption"
 	N "github.com/sagernet/sing/common/network"
 	log "github.com/sirupsen/logrus"
@@ -35,6 +36,7 @@ import (
 
 	"github.com/XrayR-project/XrayR/api"
 	"github.com/XrayR-project/XrayR/common/limiter"
+	"github.com/XrayR-project/XrayR/common/mylego"
 )
 
 type SingBoxController struct {
@@ -161,6 +163,13 @@ func (c *SingBoxController) Start() error {
 		Periodic: &task.Periodic{
 			Interval: interval,
 			Execute:  withJitter(&c.jitter, c.trafficMonitor),
+		},
+	})
+	c.tasks = append(c.tasks, periodicTask{
+		tag: "cert monitor",
+		Periodic: &task.Periodic{
+			Interval: interval * 60,
+			Execute:  c.certMonitor,
 		},
 	})
 
@@ -371,6 +380,8 @@ func (c *SingBoxController) updateInboundUsers(nodeInfo *api.NodeInfo, tag strin
 		return errUsersNotReplaceable
 	case "snell":
 		return replaceUsers(inbound, inboundUsers(names, secrets, snellUser))
+	case "trojan":
+		return replaceUsers(inbound, inboundUsers(names, secrets, trojanUser))
 	}
 	return errUsersNotReplaceable
 }
@@ -544,6 +555,10 @@ func hysteriaUser(name, secret string) sboption.HysteriaUser {
 	return sboption.HysteriaUser{Name: name, AuthString: secret}
 }
 
+func trojanUser(name, secret string) sboption.TrojanUser {
+	return sboption.TrojanUser{Name: name, Password: secret}
+}
+
 func snellUser(name, secret string) sboption.SnellUser {
 	return sboption.SnellUser{Name: name, UserKey: secret}
 }
@@ -553,7 +568,7 @@ func snellUser(name, secret string) sboption.SnellUser {
 func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, secrets []string) (*sb.Box, error) {
 	nodeType := strings.ToLower(nodeInfo.NodeType)
 	switch nodeType {
-	case "anytls", "hysteria", "snell":
+	case "anytls", "hysteria", "snell", "trojan":
 	default:
 		return nil, fmt.Errorf("unsupported node type for sing-box controller: %s", nodeInfo.NodeType)
 	}
@@ -577,8 +592,11 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 		ListenPort: uint16(nodeInfo.Port),
 	}
 
+	// Like Xray, a Trojan node with CertMode none serves plain Trojan behind a
+	// proxy that terminates TLS; AnyTLS has no plain form.
+	plainTrojan := nodeType == "trojan" && c.config.CertConfig != nil && c.config.CertConfig.CertMode == "none"
 	var tlsOptions *sboption.InboundTLSOptions
-	if nodeInfo.EnableTLS {
+	if nodeInfo.EnableTLS && !plainTrojan {
 		if c.config.CertConfig == nil || c.config.CertConfig.CertMode == "none" {
 			return nil, fmt.Errorf("tls is required but CertConfig is not configured")
 		}
@@ -591,6 +609,10 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 			CertificatePath: certFile,
 			KeyPath:         keyFile,
 		}
+	}
+
+	if c.config.EnableProxyProtocol {
+		c.logger.Warn("EnableProxyProtocol is not supported on sing-box nodes and is ignored")
 	}
 
 	inReg := sbinbound.NewRegistry()
@@ -650,6 +672,31 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 			}
 			inboundType = sbc.TypeHysteria
 			inboundOptions = hOptions
+		}
+	case "trojan":
+		// keeper serves Trojan over plain TCP only; other transports land
+		// with VMess and VLESS (P4).
+		if nodeInfo.TransportProtocol != "tcp" {
+			return nil, fmt.Errorf("trojan: unsupported transport %q", nodeInfo.TransportProtocol)
+		}
+		if nodeInfo.EnableREALITY || c.config.EnableREALITY && c.config.REALITYConfigs != nil {
+			return nil, errors.New("trojan: REALITY is not supported on sing-box nodes")
+		}
+		if c.config.EnableFallback {
+			c.logger.Warn("trojan: EnableFallback is not supported on sing-box nodes and is ignored")
+		}
+		if tlsOptions != nil {
+			// Xray's default, kept so the node looks the same to probes.
+			tlsOptions.ALPN = badoption.Listable[string]{"h2", "http/1.1"}
+		}
+		sbtrojan.RegisterInbound(inReg)
+		inboundType = sbc.TypeTrojan
+		inboundOptions = &sboption.TrojanInboundOptions{
+			ListenOptions: lo,
+			InboundTLSOptionsContainer: sboption.InboundTLSOptionsContainer{
+				TLS: tlsOptions,
+			},
+			Users: inboundUsers(names, secrets, trojanUser),
 		}
 	case "snell":
 		sbsnell.RegisterInbound(inReg)
@@ -885,6 +932,47 @@ func actionRule(match sboption.RawDefaultRule, action sboption.RuleAction) sbopt
 	return sboption.Rule{
 		Type:           sbc.RuleTypeDefault,
 		DefaultOptions: sboption.DefaultRule{RawDefaultRule: match, RuleAction: action},
+	}
+}
+
+// certMonitor renews an ACME certificate in place. The TCP inbounds reload
+// the rewritten files by themselves; QUIC needs a rebuild.
+func (c *SingBoxController) certMonitor() error {
+	c.access.Lock()
+	enableTLS := c.nodeInfo.EnableTLS
+	c.access.Unlock()
+	if !enableTLS || c.config.CertConfig == nil {
+		return nil
+	}
+	switch c.config.CertConfig.CertMode {
+	case "dns", "http", "tls":
+		lego, err := mylego.New(c.config.CertConfig)
+		if err != nil {
+			c.logger.Error(err)
+			return nil
+		}
+		_, _, renewed, err := lego.RenewCert()
+		if err != nil {
+			c.logger.Error(err)
+		} else if renewed {
+			c.reloadQUICCertificate()
+		}
+	}
+	return nil
+}
+
+// reloadQUICCertificate rebuilds a Hysteria node's box: QUIC takes its TLS
+// config once at listen and never sees the reloaded files, unlike the TCP
+// inbounds.
+func (c *SingBoxController) reloadQUICCertificate() {
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.closed || c.box == nil || !strings.EqualFold(c.boxNode.NodeType, "hysteria") {
+		return
+	}
+	users, secrets, _ := validUsers(*c.userList)
+	if err := c.rebuild(c.boxNode, users, secrets); err != nil {
+		c.logger.Error(err)
 	}
 }
 

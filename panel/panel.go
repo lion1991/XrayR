@@ -205,14 +205,9 @@ func (p *Panel) Start() {
 			}
 		}
 		nodeType := apiClient.Describe().NodeType
-		// Hysteria used to live on the sing-box controller, but xray-core
-		// v1.260327 added a native Hysteria 2 inbound + QUIC transport. We
-		// route it through the standard controller now so it benefits from
-		// the same dispatcher path (rate limiter + device tracking) as
-		// Trojan/VMess/etc. AnyTLS and Snell have no xray-core equivalent, so
-		// they stay on sing-box — which also means they miss the dispatcher's
-		// speed limiter, device limiter and audit rules.
-		if strings.EqualFold(nodeType, "AnyTLS") || strings.EqualFold(nodeType, "Snell") {
+		// Protocols move to sing-box one by one (docs/plans/sing-box-migration.md);
+		// the rest still run on Xray.
+		if strings.EqualFold(nodeType, "AnyTLS") || strings.EqualFold(nodeType, "Snell") || strings.EqualFold(nodeType, "Trojan") {
 			logConfig := p.logConfig()
 			controllerService = controller.NewSingBoxController(apiClient, controllerConfig, nodeConfig.PanelType,
 				controller.SingBoxLog{Level: logConfig.Level, Path: logConfig.ErrorPath})

@@ -1,6 +1,6 @@
 # 主内核从 Xray-core 迁到 sing-box（wkernel）
 
-Status: 已定，实施中（W1、W2、S1–S4 已完成，下一步阶段 2 的 P1）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
+Status: 已定，实施中（W1、W2、S1–S4、P1 已完成，下一步 P2）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
 
 ## 背景与目标
 
@@ -32,7 +32,7 @@ Status: 已定，实施中（W1、W2、S1–S4 已完成，下一步阶段 2 的
 
 ## 2. 架构取舍（已定，供审阅）
 
-- **每个节点一个 box**：沿用现有 `SingBoxController` 的做法，不改成全进程共享一个 box。这样做故障隔离好，也是已有代码路径。节点配置变化（端口、传输、TLS）时只重建这个节点的 box；用户变化走热更新，不断连接。证书续期不用重建 box，sing-box 会监视证书文件并自动重载。
+- **每个节点一个 box**：沿用现有 `SingBoxController` 的做法，不改成全进程共享一个 box。这样做故障隔离好，也是已有代码路径。节点配置变化（端口、传输、TLS）时只重建这个节点的 box；用户变化走热更新，不断连接。证书续期不用重建 box：TCP 上的 TLS 入站会监视证书文件并自动重载；QUIC（Hysteria）只在监听时读一次证书，续期后要重建（见 P1）。
 - **用户热更新放进 wkernel（W1）**：vmess / vless / trojan / snell / hysteria2 现在认证后只返回用户下标，入站再拿下标去查用户列表。在这种结构下直接替换列表有竞态：正在建立的连接会按新列表取名，流量记到别人头上，列表变短时还会越界 panic。
   - 改法：用户 key 直接用用户名（和 anytls 已有的 `MultiService[string]` 一样）。
   - Shadowsocks 复用它已经导出的 `adapter.ManagedSSMServer`。
@@ -141,7 +141,7 @@ Status: 已定，实施中（W1、W2、S1–S4 已完成，下一步阶段 2 的
   - 出站：`SendIP` 设成 direct 出站的源地址（IPv4 设 inet4、IPv6 设 inet6），空或未指定地址（`0.0.0.0`、`::`）不绑定；格式错误时节点启动失败。`DNSType` 按 Xray freedom 的读法映射成解析策略（`UseIPv4` → `ipv4_only`、`UseIPv4v6` → `prefer_ipv4`，`AsIs` / `UseIP` → 两种都要），只在 `EnableDNS` 时生效；认不出的值节点启动失败。节点用一个本机 DNS（系统解析器）。
   - 屏蔽私有地址：路由在 sniff 之后按上面的策略解析域名，guard 在拨号前检查。direct 只拨解析出的那组地址，所以域名只有全部解析结果都是公网才放行（覆盖 `localhost` 和"一半公网一半内网"的域名）。拒绝发生在设备数检查之前，不占名额，只打 Debug。
     - 私有范围照 Xray 的 `geoip:private`（含 `0.0.0.0/8`、CGNAT `100.64.0.0/10`、`198.18.0.0/15`、`240.0.0.0/4` 等），不用 sing-box 的 `ip_is_private`：它漏掉 CGNAT（阿里云元数据 `100.100.100.200`、Tailscale）这些段。另加 NAT64（`64:ff9b::/96`、`64:ff9b:1::/48`）和 IPv4 兼容地址（`::/96`）。判断前先去掉 IPv6 zone：`::%0` 这种写法按域名类型发来会被解析成带 zone 的地址，任何网段都不包含它，内核却照样当本机。
-    - 不拦服务器自己的公网 IP（Xray 的 `geoip:private` 也不拦）：绑在 0.0.0.0、只靠云安全组或针对外网网卡的防火墙挡住的服务，用户连"服务器公网 IP:端口"仍能从本机访问到。
+    - 不拦服务器自己的公网 IP（Xray 的 `geoip:private` 也不拦）：绑在 0.0.0.0、只靠云安全组或针对外网网卡的防火墙挡住的服务，用户连"服务器公网 IP:端口"仍能从本机访问到。用户决定不加（2026-10-30）：不把本机网卡地址加进屏蔽集合。
     - `0.0.0.0` / `::` 是私有：内核把它当本机，TCP 连 `0.0.0.0:6379` 就是连本机 Redis。唯一的例外是目标就是未指定地址的包连接——legacy UoT 路由时没有目标——放进来后每个包再查。
     - 包连接（XUDP、UoT）里每个包都查：IP 直接判断，域名先查一次本机 DNS，结果全是公网才放行。direct 会再解析一次，两次之间 DNS 答案变了（DNS rebinding）能绕过，已知未修。
     - 测试要连本机的回显服务，用只在测试里可见的开关关掉这项检查，其余规则不变。
@@ -163,6 +163,13 @@ Status: 已定，实施中（W1、W2、S1–S4 已完成，下一步阶段 2 的
 | P3 | Hysteria2 | 从 Xray 移回 sing-box；obfs、带宽沿用旧 sing-box 实现。version 不是 2 时直接拒绝（现在的 sing-box 代码遇到 version 为 0 会按 Hysteria 1 启动） |
 | P4 | VMess / VLESS | tcp / ws / grpc / httpupgrade；VLESS flow |
 | P5 | VLESS Reality + Vision | 映射 Reality 字段：`MaxTimeDiff` 的毫秒值要转成 Duration，本地 `REALITYConfigs` / `DisableLocalREALITYConfig` 两条路径都要处理，Reality 节点不要求 CertConfig。按决定 1 放弃的字段遇到时打警告。e2e 测试替代 `reality_smoke_test.go` |
+
+- **P1** Trojan（已完成）：keeper 的 Trojan 节点固定是 tcp + TLS，用户密钥用 UUID（keeper 不给 Trojan 发 Passwd，和 Xray 一致），用户变化热更新不重建。
+  - 其他传输（ws / grpc 等）和 REALITY 节点启动报错，留到 P4 / P5。`EnableFallback` 打警告后忽略（决定 1）；`EnableProxyProtocol` 对所有 sing-box 节点都打警告后忽略。Xray 的 mux.cool 不支持，wkernel 客户端用不上。
+  - `CertMode: none` 照 Xray 提供明文 Trojan（TLS 由前置代理卸载）；AnyTLS 没有明文形式，仍报错。ALPN 照 Xray 服务端默认协商 `h2, http/1.1`，主动探测看到的 TLS 表现不变。
+  - 证书续期：以前 sing-box 控制器不续期，dns / http 模式的证书约 90 天后过期（AnyTLS 节点一直有这个问题）。现在和 Xray 一样每 60×`UpdatePeriodic` 秒调一次续期，新文件由 sing-box 重载；Hysteria 节点续期成功后重建 box。
+  - wkernel 的证书重载有竞争：证书和私钥两个回调并发执行，两边都可能配出"新证书 + 旧私钥"，重载失败后旧证书一直用到过期。已在 wkernel `65c53531` 修复（本地提交，未推送）；XrayR 升级到含该提交的版本之前续期仍可能不生效，`TestTrojanNodeReloadsCertificate` 也先跳过，升级时去掉跳过。
+  - 依赖：trojan 入站引入 v2ray 传输的间接依赖（`gobwas/httphead`、`gobwas/pool`、`sagernet/ws`）。
 
 每步都要验证：e2e 测试通过；灰度服务器的流量上报、在线 IP、限速和 Xray 时期一致；CPU 和吞吐不明显变差。
 
@@ -191,4 +198,5 @@ Status: 已定，实施中（W1、W2、S1–S4 已完成，下一步阶段 2 的
   - snell v5 的 salt 过滤器被清空，历史抓包的首包可以再重放一次；
   - 每个服务带约 6MB 过滤器，有长连接挂在旧服务上时释放不了。
   根治要在 sing-snell 里把用户表改成原子存储，就不用重建服务。S2 只在变化时更新，可以把影响压到很小。
+- mylego 的老问题（Xray 控制器同样存在，不在本方案内修）：tls 模式续期要监听 :443，节点自己占着 443 时每次续期都失败；同一进程多个节点共用一个域名时会并发续期、交错写同一组文件，可能写出不配对的证书和私钥；`CertDomain` 含大写时续期结果写到另一个文件，节点读不到。
 - 已知的遗留问题，不在本方案内修：Xray 控制器上 keeper 的空用户列表会被当成拉取失败，删掉节点最后一个用户永远不生效；被删用户最后一个周期的流量不会上报。sing-box 控制器在 S2 里已经处理了这两点，Xray 控制器迁移完会删除。
