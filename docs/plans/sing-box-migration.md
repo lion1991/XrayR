@@ -1,6 +1,6 @@
 # 主内核从 Xray-core 迁到 sing-box（wkernel）
 
-Status: 草案，待确认第 1 节的决定项后实施。实施开始时把"迁移主内核"写成 ADR。
+Status: 已定，实施中（下一步 W1）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
 
 ## 背景与目标
 
@@ -9,25 +9,23 @@ Status: 草案，待确认第 1 节的决定项后实施。实施开始时把"�
 - 目标：服务端只依赖 wkernel 一个内核，两端协议实现同源；删除 Xray-core 依赖和 `app/mydispatcher`。
 - 不做：改动面板（keeper）协议；新增客户端功能。
 
-## 1. 需要你确认的决定
+## 1. 已定的决定（2026-10-29 用户确认）
 
-1. **放弃以下 Xray 独有能力**。wkernel 客户端本来就用不上的标 ★，其余只影响服务端：
+1. **放弃以下 Xray 独有能力**（用户确认都没在用）。wkernel 客户端本来就用不上的标 ★，其余只影响服务端：
    - ★ xhttp / splithttp 传输
    - ★ Reality 的 `Mldsa65Seed`、`MinClientVer` / `MaxClientVer`
    - Reality 的 `Show`、`Xver`（回落目标的 PROXY protocol）、`LimitFallbackUpload/Download`；`ServerNames` 只保留第一个（sing-box 的 Reality 只接受单个 server_name）
    - `EnableFallback` / `FallBackConfigs`（VLESS 无回落；Trojan 只有单一回落和按 ALPN 回落）
    - `EnableProxyProtocol`（sing-box 1.6 起已移除入站 PROXY protocol）
-   - TCP 传输的 HTTP 头伪装（`Header`）。注意：keeper 给 **SS 节点配 obfs=http** 时也走这条路径，如果有 SS 节点在用 obfs=http，这一项就不是无影响的，需要另找办法
+   - TCP 传输的 HTTP 头伪装（`Header`），包括 keeper 给 SS 节点配 obfs=http 的情况（目前没有节点在用）
    - `ConnectionConfig`（握手超时、连接空闲 30s 断开、单向超时、缓冲区大小）：sing-box 没有 TCP 空闲超时
    - `CertConfig.RejectUnknownSni`、OCSP stapling
    - Log 的 `AccessPath`（访问日志）。日志级别和错误日志会映射过去
    - WebSocket 传输的 Host 校验（sing-box 的 ws 服务端不校验 Host，httpupgrade 校验）
    - 以下不算放弃，属于直接删除的死代码：`Shadowsocks-Plugin`（keeper 不支持这个类型）、`DisableIVCheck`（现在已经不起作用）
-2. **节点本地的 `dns.json` / `route.json` / `custom_inbound.json` / `custom_outbound.json` 是否在用**。
-   - 没在用就直接删掉这四个配置项。
-   - 在用的话需要新增一个 sing-box 格式的配置项（例如 `SingBoxConfigPath`，内容合并进每个节点的 box），并且要在第 2 阶段之前做好，否则迁过去的节点会丢失分流。原来的 `geosite:` / `geoip:` 写法要改成 rule-set，sing-box 不再支持 .dat 文件。
-   - 另外要决定是否**默认屏蔽访问私有 IP**（`ip_is_private` → reject）。示例 `route.json` 里屏蔽了 `geoip:private`，没配 route.json 的节点现在是不屏蔽的，用户可以借节点访问服务器本机或内网服务（比如设备数限制用的 Redis）。建议默认屏蔽。
-3. **删除用户时立即断开该用户的现有连接**。Xray 现在的行为是删除用户后已建立的连接还能继续用，直到客户端断开。建议改为立即断开。增删按 UID 判断，面板只改了限速或设备数的用户不会被断开。
+2. **删除节点本地的 `dns.json` / `route.json` / `custom_inbound.json` / `custom_outbound.json`**：这四个是 Xray 格式的文件，sing-box 不需要，用户确认不再保留。删掉 `DnsConfigPath` 等四个配置项和读取代码，不做 sing-box 格式的替代配置（原 S5 取消），`release/config/` 下的示例文件和 geoip/geosite.dat 一并删除。
+   - sing-box 节点在代码里**默认屏蔽访问私有 IP 和 BT**（`ip_is_private`、`protocol: bittorrent` → reject），不加配置项。原因：没配 route.json 的节点现在不屏蔽，用户可以借节点访问服务器本机或内网服务（比如设备数限制用的 Redis），BT 会招来版权投诉。
+3. **删除用户时立即断开该用户的现有连接**。Xray 现在的行为是删除用户后已建立的连接还能继续用，直到客户端断开。增删按 UID 判断，面板只改了限速或设备数的用户不会被断开。
 4. **CI 拉取 wkernel 的凭据**（已定、已配好）。XrayR 继续在 GitHub Actions 构建、推 ghcr.io，不搬到 Forgejo，也不把 wkernel 镜像到 GitHub（两者都要多存一个凭据，服务器拉取地址或同步链路还得跟着变）。凭据是 Wkernel 仓库上的 deploy key `xrayr-github-ci`，**只读**：私钥存 XrayR 的 Actions secret `WKERNEL_DEPLOY_KEY`，本机副本在 `~/.ssh/wkernel_deploy`。已实测能读、写被拒。
    - 否决：给这把 key 写权限。私钥在公开仓库的 CI 里，泄露即可往所有客户端的内核投毒；以后真要 CI 写 wkernel，另加一把 key。
    - 待 S1 实测：GitHub 构建机能否连上 `git.wrlog.cn:2222`；连不上再改为把 wkernel 镜像到 GitHub 私有仓库。
@@ -74,8 +72,7 @@ Status: 草案，待确认第 1 节的决定项后实施。实施开始时把"�
 - **S1** 把 XrayR 依赖的 sing-box 换成 wkernel（`replace`），接通 CI 拉取；加上构建 tag。验证：编译，跑 `snell_e2e_test.go` 等现有测试。
 - **S2** 用户热更新：定时拉取用户列表，按 UID 区分增删和属性变化，属性变化只更新 limiter。节点信息变化时重建 box。每次拉取时刷新 jitter（现在只在启动时读一次）。决定 3 要的断开放到 S3 做，因为需要连接登记表。
 - **S3** 管控：包装出站（设备数、限速、审计）；连接追踪器负责流量计数和连接登记；删除用户时断开现有连接；在线 IP 按存活连接统计并上报（现在只统计新建连接，长连接用户会漏报）；定时拉取审计规则；自动限速。把 `singbox_traffic.go` 里每条连接一条的 Info 日志降级，UDP 日志里写死的 "AnyTLS" 也改掉。
-- **S4** 出站和日志：`SendIP`、`DNSType`、默认路由 sniff、日志级别和错误日志映射（现在 sing-box 控制器把日志整个关掉了）；按决定 2 处理私有 IP 屏蔽。
-- **S5**（看决定 2）sing-box 格式的自定义 DNS、路由、出站配置。
+- **S4** 出站和日志：`SendIP`、`DNSType`、默认路由 sniff、日志级别和错误日志映射（现在 sing-box 控制器把日志整个关掉了）；默认屏蔽私有 IP 和 BT（决定 2）。BT 识别依赖 sniff。
 
 完成后 AnyTLS 和 Snell 节点的功能与 Xray 节点持平。部署一台服务器自用验证，再全量。
 
@@ -86,7 +83,7 @@ Status: 草案，待确认第 1 节的决定项后实施。实施开始时把"�
 | 步骤 | 协议 | 要点 |
 |---|---|---|
 | P1 | Trojan | TLS 证书来自 CertConfig |
-| P2 | Shadowsocks | 含 SS2022 多用户（`ServerKey` + 用户 PSK）；按决定 1 处理 obfs=http |
+| P2 | Shadowsocks | 含 SS2022 多用户（`ServerKey` + 用户 PSK）；面板配了 obfs=http 时节点启动报错，不静默降级 |
 | P3 | Hysteria2 | 从 Xray 移回 sing-box；obfs、带宽沿用旧 sing-box 实现。version 不是 2 时直接拒绝（现在的 sing-box 代码遇到 version 为 0 会按 Hysteria 1 启动） |
 | P4 | VMess / VLESS | tcp / ws / grpc / httpupgrade；VLESS flow |
 | P5 | VLESS Reality + Vision | 映射 Reality 字段：`MaxTimeDiff` 的毫秒值要转成 Duration，本地 `REALITYConfigs` / `DisableLocalREALITYConfig` 两条路径都要处理，Reality 节点不要求 CertConfig。按决定 1 放弃的字段遇到时打警告。e2e 测试替代 `reality_smoke_test.go` |
@@ -102,10 +99,10 @@ Status: 草案，待确认第 1 节的决定项后实施。实施开始时把"�
 - **R1** 删除以下内容：
   - `app/mydispatcher`
   - `controller.go` / `control.go` / `inboundbuilder.go` / `outboundbuilder.go` / `userbuilder.go`，以及依赖它们的测试
-  - `panel.go` 里的 Xray 实例和全局配置
+  - `panel.go` 里的 Xray 实例和全局配置，包括 `DnsConfigPath` / `RouteConfigPath` / `InboundConfigPath` / `OutboundConfigPath`（决定 2）
   - `common/serverstatus`、`cmd/mldsa65.go`、`cmd/distro/all`
 - **R2** `api` 包去掉 Xray 类型：`NodeInfo.NameServerConfig`（面板下发的 `dns` 路由现在没有被使用，直接删掉）、`HttpHeaders` 里的 `conf.StringList`、`keeper.go` 引用的 `net` / `conf`。
-- **R3** 清理 go.mod，更新 README、示例配置和本文档状态。跑全部回归用例。
+- **R3** 清理 go.mod，更新 README、示例配置（删除 `release/config/` 下四个 json 和 geoip/geosite.dat）和本文档状态。跑全部回归用例。
 
 ## 4. 风险与待实测
 
