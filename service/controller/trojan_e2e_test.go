@@ -193,11 +193,6 @@ func TestTrojanNodeRejectsUnsupportedSettings(t *testing.T) {
 // A renewed certificate is served without rebuilding the box: certMonitor
 // only rewrites the files.
 func TestTrojanNodeReloadsCertificate(t *testing.T) {
-	if os.Getenv("XRAYR_WKERNEL_TLS_RELOAD_FIX") == "" {
-		// The pinned wkernel races its certificate and key reloads, so this
-		// flakes until the dependency includes wkernel 65c53531.
-		t.Skip("needs wkernel 65c53531; set XRAYR_WKERNEL_TLS_RELOAD_FIX=1 to run")
-	}
 	certConfig := writeTestCert(t)
 	_, c, nodeAddr := startTrojanNode(t, certConfig)
 	serial := func() int64 {

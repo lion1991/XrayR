@@ -5,7 +5,7 @@ Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，P4 取消�
 ## 背景与目标
 
 - 现状：VMess / VLESS（含 Reality）/ Trojan / Shadowsocks / Hysteria2 走 Xray-core（`service/controller/controller.go`），AnyTLS、Snell 走上游 sing-box（`singbox_controller.go`，依赖 v1.15.0-alpha.3）。要同时追两个内核，Xray 侧还维护着一份分叉的 dispatcher（`app/mydispatcher`）。
-- 客户端统一用 wkernel（`../wkernel`，sing-box 分支，当前 `v1.15.0-alpha.13-w`，module 名仍是 `github.com/sagernet/sing-box`）。
+- 客户端统一用 wkernel（`../wkernel`，sing-box 分支，XrayR 当前依赖 `v1.15.0-alpha.13-w.2`，module 名仍是 `github.com/sagernet/sing-box`）。
 - 目标：服务端只依赖 wkernel 一个内核，两端协议实现同源；删除 Xray-core 依赖和 `app/mydispatcher`。
 - 不做：改动面板（keeper）协议；新增客户端功能。
 
@@ -169,7 +169,7 @@ Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，P4 取消�
   - 其他传输（ws / grpc 等）和 REALITY 节点启动报错，REALITY 留到 P5（ws / grpc 等不再做，决定 5）。`EnableFallback` 打警告后忽略（决定 1）；`EnableProxyProtocol` 对所有 sing-box 节点都打警告后忽略。Xray 的 mux.cool 不支持，wkernel 客户端用不上。
   - `CertMode: none` 照 Xray 提供明文 Trojan（TLS 由前置代理卸载）；AnyTLS 没有明文形式，仍报错。ALPN 照 Xray 服务端默认协商 `h2, http/1.1`，主动探测看到的 TLS 表现不变。
   - 证书续期：以前 sing-box 控制器不续期，dns / http 模式的证书约 90 天后过期（AnyTLS 节点一直有这个问题）。现在和 Xray 一样每 60×`UpdatePeriodic` 秒调一次续期，新文件由 sing-box 重载；Hysteria 节点续期成功后重建 box。
-  - wkernel 的证书重载有竞争：证书和私钥两个回调并发执行，两边都可能配出"新证书 + 旧私钥"，重载失败后旧证书一直用到过期。已在 wkernel `65c53531` 修复（本地提交，未推送）；XrayR 升级到含该提交的版本之前续期仍可能不生效，`TestTrojanNodeReloadsCertificate` 也先跳过，升级时去掉跳过。
+  - wkernel 的证书重载有竞争：证书和私钥两个回调并发执行，两边都可能配出"新证书 + 旧私钥"，重载失败后旧证书一直用到过期。已在 wkernel `65c53531` 修复，随 `v1.15.0-alpha.13-w.2` 发布（同时修了 Snell UoT 的 panic `af7d6a60`），XrayR 已升级，`TestTrojanNodeReloadsCertificate` 不再跳过。
   - 依赖：trojan 入站引入 v2ray 传输的间接依赖（`gobwas/httphead`、`gobwas/pool`、`sagernet/ws`）。
 - **P2** Shadowsocks（已完成）：走 sing-box 多用户入站，用户变化经 `ManagedSSMServer.UpdateUsers` 原地替换，不重建。
   - 密钥和 Xray 时期对 keeper 的派生一致，订阅不用变：SS2022 的服务端密钥是面板 `ServerKey`，用户 PSK 是密码（没有就用 UUID）前 16 / 32 字节的 base64；传统 AEAD 直接用密码。
