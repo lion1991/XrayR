@@ -39,6 +39,7 @@ type fakeSnellAPI struct {
 	// keeper keys a report by uid, so a repeated uid loses traffic there.
 	repeatedUID bool
 	online      [][]api.OnlineUser
+	rules       []api.DetectRule
 }
 
 func (f *fakeSnellAPI) GetNodeInfo() (*api.NodeInfo, error) {
@@ -116,7 +117,18 @@ func (f *fakeSnellAPI) onlineReports(uid int) int {
 	return count
 }
 
-func (f *fakeSnellAPI) GetNodeRule() (*[]api.DetectRule, error) { return &[]api.DetectRule{}, nil }
+func (f *fakeSnellAPI) GetNodeRule() (*[]api.DetectRule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rules := append([]api.DetectRule{}, f.rules...)
+	return &rules, nil
+}
+
+func (f *fakeSnellAPI) setRules(rules []api.DetectRule) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rules = rules
+}
 func (f *fakeSnellAPI) ReportIllegal(*[]api.DetectResult) error { return nil }
 func (f *fakeSnellAPI) Debug()                                  {}
 

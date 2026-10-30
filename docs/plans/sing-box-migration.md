@@ -46,7 +46,7 @@ Status: 已定，实施中（W1、W2、S1、S2 已完成，下一步 S3）。架
 
   连接追踪器只负责流量计数和按用户登记存活连接，供决定 3 的断开和在线 IP 统计用。
   - `common/limiter`、`common/rule` 里的 Xray 依赖（`errors`、`common`、`buf`）换成标准库，`rate.go` 改成包装 net.Conn / PacketConn。
-  - 审计改为匹配 `metadata.Domain`。Xray 匹配的是 `tcp:host:port` 这种字符串，依赖这个格式的面板规则要调整。要拿到域名，节点必须开启路由 sniff（受 `DisableSniffing` 控制）。
+  - 审计沿用 Xray 的匹配字符串 `tcp:host:port`，拨号地址和 sniff 到的域名（`metadata.Domain`）各匹配一次，任一命中就拒绝（细节见 S3c），面板规则不用调整（S3c 实施时改定；原方案是只匹配域名、调整面板规则）。要拿到域名，节点必须开启路由 sniff（受 `DisableSniffing` 控制）。
   - UDP 的限制：XUDP / packetaddr 一条连接里可以有多个目标，只能按第一个目标做审计。
 - **监听和出站地址**：`ListenIP` 原样传给 sing-box。所有节点目前都没有 IPv6（用户确认），`0.0.0.0` 只监听 IPv4 不影响使用，所以不做 `::` 映射；以后节点加了 IPv6 再改。`SendIP` 是 `0.0.0.0` 时当作没设置。`DNSType` 映射到 `domain_resolver.strategy`，旧的 `domain_strategy` 已废弃。
 - **构建 tag**（S1 已定）：只加 `with_utls`（Reality 需要），写在 `release/build_tags`，Dockerfile 和 `scripts/verify.sh` 都读这个文件。
@@ -124,7 +124,15 @@ Status: 已定，实施中（W1、W2、S1、S2 已完成，下一步 S3）。架
   - 只有建连时有限速的用户才包装连接，没限速的用户走原来的拷贝路径。包装层转发 `CloseWrite`（和拷贝一样先越过下面的流量计数层），不把半关闭变成全关闭（snell v5 靠它告诉客户端目标为什么断开；`TestRateConnHalfCloses`）。限速被取消时，令牌桶改成不限，已有连接立即生效；没限速的用户新加了限速，只对新连接生效（Xray 也是这样）。自动限速要对已有连接生效，留给 S3d 处理。
   - 留给 S3d：超设备数时每条被拒的流都打一条 Warn，客户端重试会刷屏，降级日志时改成限频；限速等待中的连接关闭后要等这段等待结束才释放（有界，不会卡死）。
   - 已核对：sing 的拷贝只在包装层声明可替换时才拆包装，splice 只用于 TUN，所以限速包装不会被零拷贝绕过（第 4 节的待实测项已有结论）。
-- **S4** 出站和日志：`SendIP`、`DNSType`、默认路由 sniff、日志级别和错误日志映射（现在 sing-box 控制器把日志整个关掉了）；默认屏蔽私有 IP 和 BT（决定 2）。BT 识别依赖 sniff。
+
+  S3c 已完成（回归用例 `TestSingBoxNodeAudits`、`TestAuditTargets`、keeper 的 `TestCompileRuleSkipsWhatBreaksTheNode`）：
+  - 默认路由加一条无条件的 sniff 规则，`DisableSniffing` 关掉，和 Xray 节点默认开 sniff 一致（原定在 S4 做，审计依赖它，提前到这里）。sniff 只填 `metadata.Domain`，不改拨号目标。代价：服务器先发数据的协议（SSH 等）和不带换行的首包建连时最多多等 sniff 超时（300ms），Xray 节点同样如此。wkernel 对邮件端口（25/465/587/143/993/110/995）跳过 sniff，所以这些端口上的 TLS 只能按 IP 审计，Xray 会 sniff。
+  - 匹配串整体转小写：Xray 的 HTTP sniff 会把 Host 转小写，sing 不会，大写 Host 会绕过规则；面板规则按小写写。UDP over TCP（AnyTLS 的 UDP 都走它）在 `metadata.Domain` 里留的是魔法域名 `sp.v2.udp-over-tcp.arpa`，审计时忽略它，按真实目标匹配。旧版 UoT（`sp.udp-over-tcp.arpa`）的目标逐包携带，连接上只有 `0.0.0.0:0`，和 XUDP 一样审计不到。这两点由 `TestAuditTargets` 覆盖；UoT 没有 e2e（snell v6 + UoT 会让进程崩溃，是 wkernel 侧的已有问题，另行处理）。
+  - 拨号地址和 sniff 到的域名各生成一个匹配串，任一命中就拒绝。Xray 会改成按 sniff 到的域名拨号，一个串就够；sing 仍拨原地址，只看域名的话，客户端用允许的 SNI / Host 就能连被封的地址。代价是比 Xray 严：封了某个 IP，经这个 IP 访问允许的域名也会被拒。
+  - 审计在 guard 里、设备数检查之前做，对所有连接生效（包括没有用户的 shared-psk snell）。命中只拒绝并打 Warn 日志，不记录违规：keeper 的违规上报是空实现（见上）。每次命中一条 Warn，和设备数拒绝一样留给 S3d 限频。
+  - 规则每个拉取周期在拉完节点信息后拉一次（keeper 从节点信息里取规则），`DisableGetRule` 关掉。面板清空规则时节点上的规则也清空；Xray 侧原来只在规则非空时更新，删光规则后旧规则一直生效，一并修了。
+  - keeper 顺手修（Xray 节点也受益）：面板或本地规则文件里的正则写错会让进程 panic，空规则或空的备选项（比如没填匹配项的 block 路由、匹配项里有空串时拼出的 `a.com|`、规则文件里的空行）会匹配所有目标、拒绝全部流量，现在逐项包成 `(?:…)` 编译（避免 `(?i)`、未闭合的 `\Q` 影响其他项），写错的项和能匹配空串的项（空白、`.*`、`^`、`foo|` 等）单独去掉并打日志，同一条路由里其余的项照常生效（写错的项每次拉取都会报一次，直到面板改好）；规则 ID 改用面板路由的 id，原来是它在列表里的下标；本地规则列表不再被每次拉取的 append 共用底层数组。
+- **S4** 出站和日志：`SendIP`、`DNSType`、日志级别和错误日志映射（现在 sing-box 控制器把日志整个关掉了）；默认屏蔽私有 IP 和 BT（决定 2）。BT 识别依赖 sniff（S3c 已开）。
 
 完成后 AnyTLS 和 Snell 节点的功能与 Xray 节点持平。部署一台服务器自用验证，再全量。
 

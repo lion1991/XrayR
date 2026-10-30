@@ -1,9 +1,11 @@
 package controller_test
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -290,5 +292,61 @@ func TestSingBoxNodeLimitsAndReportsOnline(t *testing.T) {
 	before := f.onlineReports(43)
 	waitFor(t, "three more online reports listing uid 43", func() bool {
 		return f.onlineReports(43) >= before+3
+	})
+}
+
+// tlsReaches reports whether a TLS client naming serverName gets any byte to
+// the echo server behind the node.
+func tlsReaches(t *testing.T, nodeAddr, echo string, received *atomic.Int64, serverName string) bool {
+	t.Helper()
+	before := received.Load()
+	conn, err := snellDial(t, nodeAddr, snellTestUUID, echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	// The echo server answers the ClientHello with itself, so the handshake
+	// fails either way; what counts is whether the ClientHello got through.
+	_ = tls.Client(conn, &tls.Config{ServerName: serverName, InsecureSkipVerify: true}).Handshake()
+	time.Sleep(200 * time.Millisecond)
+	return received.Load() > before
+}
+
+// Audit rules match "tcp:host:port" like Xray, against both the dialed
+// address and the sniffed domain, and stop applying once the panel drops them.
+func TestSingBoxNodeAudits(t *testing.T) {
+	panel, nodeAddr := startSnellNode(t, true)
+	blockedIP, blockedReceived := startCountingEchoServer(t)
+	open, openReceived := startCountingEchoServer(t)
+	if !proxies(t, nodeAddr, snellTestUUID, blockedIP) {
+		t.Fatal("the node does not proxy before any rule")
+	}
+
+	panel.setRules([]api.DetectRule{
+		{ID: 1, Pattern: regexp.MustCompile("^tcp:" + regexp.QuoteMeta(blockedIP) + "$")},
+		{ID: 2, Pattern: regexp.MustCompile(`blocked\.test`)},
+	})
+	waitFor(t, "the rule on the IP to apply", func() bool {
+		return !proxies(t, nodeAddr, snellTestUUID, blockedIP)
+	})
+	if !proxies(t, nodeAddr, snellTestUUID, open) {
+		t.Fatal("a destination no rule matches was rejected")
+	}
+	if tlsReaches(t, nodeAddr, open, openReceived, "blocked.test") {
+		t.Fatal("a TLS connection to a blocked domain got through (sniffing off?)")
+	}
+	if !tlsReaches(t, nodeAddr, open, openReceived, "fine.test") {
+		t.Fatal("a TLS connection to an allowed domain was rejected")
+	}
+	// sing dials the address, not the sniffed name, so an allowed SNI must
+	// not carry a connection to a blocked address.
+	if tlsReaches(t, nodeAddr, blockedIP, blockedReceived, "fine.test") {
+		t.Fatal("an allowed SNI carried a connection to a blocked address")
+	}
+
+	panel.setRules(nil)
+	waitFor(t, "the dropped rules to stop applying", func() bool {
+		return proxies(t, nodeAddr, snellTestUUID, blockedIP)
 	})
 }

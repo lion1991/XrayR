@@ -112,6 +112,7 @@ func (c *SingBoxController) Start() error {
 	c.traffic = newSingBoxTrafficTracker(c.logger)
 	c.guard = newSingBoxGuard(c.logger, limiter.NewGlobalLimiter(c.config.GlobalDeviceLimitConfig))
 	c.credentials = make(map[int]credential)
+	c.pullRules()
 
 	c.access.Lock()
 	c.nodeInfo = newNodeInfo
@@ -174,6 +175,8 @@ func (c *SingBoxController) nodeInfoMonitor() error {
 		c.logger.Print("server port must > 0")
 		newNodeInfo = nil
 	}
+	// keeper derives the rules from the node info it just pulled.
+	c.pullRules()
 	newUserInfo, err := getUserList(c.apiClient)
 	if err != nil {
 		if err.Error() != api.UserNotModified {
@@ -198,6 +201,22 @@ func (c *SingBoxController) nodeInfoMonitor() error {
 		c.logger.Print(err)
 	}
 	return nil
+}
+
+// pullRules hands the panel's audit rules to the guard. An empty list clears
+// them, so rules removed on the panel stop applying.
+func (c *SingBoxController) pullRules() {
+	if c.config.DisableGetRule {
+		return
+	}
+	rules, err := c.apiClient.GetNodeRule()
+	if err != nil {
+		if err.Error() != api.RuleNotModified {
+			c.logger.Printf("Get rule list failed: %s", err)
+		}
+		return
+	}
+	c.guard.setRules(*rules)
 }
 
 func (c *SingBoxController) Close() error {
@@ -730,6 +749,7 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 					Options: &guardOutboundOptions{guard: c.guard},
 				},
 			},
+			Route: c.routeOptions(),
 		},
 		Context: ctx,
 	}
@@ -740,6 +760,22 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 	}
 	boxInstance.Router().AppendTracker(c.traffic)
 	return boxInstance, nil
+}
+
+// routeOptions sniffs every connection unless sniffing is off, as Xray nodes
+// do: audit rules match the sniffed domain of a client that dialed an IP.
+func (c *SingBoxController) routeOptions() *sboption.RouteOptions {
+	if c.config.DisableSniffing {
+		return nil
+	}
+	return &sboption.RouteOptions{
+		Rules: []sboption.Rule{{
+			Type: sbc.RuleTypeDefault,
+			DefaultOptions: sboption.DefaultRule{
+				RuleAction: sboption.RuleAction{Action: sbc.RuleActionTypeSniff},
+			},
+		}},
+	}
 }
 
 // trafficMonitor reports every counter with traffic on it, including users

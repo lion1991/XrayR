@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sbadapter "github.com/sagernet/sing-box/adapter"
@@ -16,7 +17,9 @@ import (
 	sblog "github.com/sagernet/sing-box/log"
 	sboption "github.com/sagernet/sing-box/option"
 	sbdirect "github.com/sagernet/sing-box/protocol/direct"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 	"github.com/sagernet/sing/service"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
@@ -28,6 +31,7 @@ import (
 var (
 	errUserNotServed = errors.New("user is no longer served by this node")
 	errDeviceLimit   = errors.New("user reached the device limit")
+	errAuditRule     = errors.New("destination is rejected by an audit rule")
 )
 
 // singBoxGuard decides, before dialing, whether a user's connection may go
@@ -44,6 +48,7 @@ var (
 //     connection stays online.
 //   - A user with a speed limit gets one token bucket shared by all their
 //     connections, both directions.
+//   - A destination matching an audit rule is turned away, for every user.
 //
 // It outlives box rebuilds, like the traffic tracker.
 type singBoxGuard struct {
@@ -60,6 +65,8 @@ type singBoxGuard struct {
 	nodeSpeedLimit uint64
 	policies       map[int]userPolicy
 	buckets        map[int]*rate.Limiter
+
+	rules atomic.Pointer[[]api.DetectRule]
 }
 
 type userPolicy struct {
@@ -265,6 +272,46 @@ func (g *singBoxGuard) onlineUsers() []api.OnlineUser {
 	return online
 }
 
+func (g *singBoxGuard) setRules(rules []api.DetectRule) {
+	g.rules.Store(&rules)
+}
+
+// audit returns the first audit rule metadata's destination matches.
+func (g *singBoxGuard) audit(metadata *sbadapter.InboundContext) (rule api.DetectRule, target string, hit bool) {
+	rules := g.rules.Load()
+	if rules == nil || len(*rules) == 0 {
+		return api.DetectRule{}, "", false
+	}
+	for _, target := range auditTargets(metadata) {
+		for _, rule := range *rules {
+			if rule.Pattern.MatchString(target) {
+				return rule, target, true
+			}
+		}
+	}
+	return api.DetectRule{}, "", false
+}
+
+// auditTargets renders the destination the way Xray does ("tcp:host:port"),
+// so the panel's rules keep matching as they did on Xray nodes: the address
+// dialed and, if sniffed, the domain. Xray dials the sniffed domain, so one
+// string covers both there; sing dials the address, and a client could hide
+// it behind an allowed SNI or Host. They are lowercased: Xray lowercases the
+// sniffed HTTP host and sing does not, and a rule should not be dodged by
+// case anyway.
+func auditTargets(metadata *sbadapter.InboundContext) []string {
+	destination := metadata.Destination.Unwrap()
+	targets := []string{strings.ToLower(metadata.Network + ":" + destination.String())}
+	// UDP over TCP leaves its magic name in Domain, not a sniffed one.
+	if domain := metadata.Domain; domain != "" && domain != uot.MagicAddress && domain != uot.LegacyMagicAddress {
+		sniffed := strings.ToLower(metadata.Network + ":" + M.Socksaddr{Fqdn: domain, Port: destination.Port}.String())
+		if sniffed != targets[0] {
+			targets = append(targets, sniffed)
+		}
+	}
+	return targets
+}
+
 // effectiveRate is the stricter of the node's and the user's limit, either
 // of which may be 0 for none.
 func effectiveRate(nodeLimit, userLimit uint64) uint64 {
@@ -315,6 +362,10 @@ func newGuardOutbound(ctx context.Context, router sbadapter.Router, logger sblog
 }
 
 func (h *guardOutbound) NewConnection(ctx context.Context, conn net.Conn, metadata sbadapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if err := h.checkAudit(&metadata); err != nil {
+		N.CloseOnHandshakeFailure(conn, onClose, err)
+		return
+	}
 	release, bucket, err := h.guard.admit(metadata.User, metadata.Source.Addr, conn)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -326,7 +377,13 @@ func (h *guardOutbound) NewConnection(ctx context.Context, conn net.Conn, metada
 	h.connection.NewConnection(ctx, h.Outbound, conn, metadata, releaseOnClose(release, onClose))
 }
 
+// NewPacketConnection audits the first destination only: a packet connection
+// (XUDP, packetaddr) may later send to others.
 func (h *guardOutbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata sbadapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if err := h.checkAudit(&metadata); err != nil {
+		N.CloseOnHandshakeFailure(conn, onClose, err)
+		return
+	}
 	release, bucket, err := h.guard.admit(metadata.User, metadata.Source.Addr, conn)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -336,6 +393,16 @@ func (h *guardOutbound) NewPacketConnection(ctx context.Context, conn N.PacketCo
 		conn = &ratePacketConn{PacketConn: conn, bucket: bucket}
 	}
 	h.connection.NewPacketConnection(ctx, h.Outbound, conn, metadata, releaseOnClose(release, onClose))
+}
+
+func (h *guardOutbound) checkAudit(metadata *sbadapter.InboundContext) error {
+	rule, target, hit := h.guard.audit(metadata)
+	if !hit {
+		return nil
+	}
+	uid, _, _ := parseUserTag(metadata.User) // 0 for a connection without user
+	h.guard.logger.Warnf("uid %d: access to %s rejected by audit rule %d", uid, target, rule.ID)
+	return errAuditRule
 }
 
 func releaseOnClose(release func(), onClose N.CloseHandlerFunc) N.CloseHandlerFunc {

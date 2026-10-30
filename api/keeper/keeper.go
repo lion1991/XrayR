@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -110,10 +111,9 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 
 		// read line by line
 		for fileScanner.Scan() {
-			LocalRuleList = append(LocalRuleList, api.DetectRule{
-				ID:      -1,
-				Pattern: regexp.MustCompile(fileScanner.Text()),
-			})
+			if pattern := compileRule(fileScanner.Text()); pattern != nil {
+				LocalRuleList = append(LocalRuleList, api.DetectRule{ID: -1, Pattern: pattern})
+			}
 		}
 		// handle first encountered error while reading
 		if err := fileScanner.Err(); err != nil {
@@ -312,18 +312,46 @@ func (c *APIClient) ReportUserTraffic(userTraffic *[]api.UserTraffic) error {
 func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 	routes := c.resp.Load().(*serverConfig).Routes
 
-	ruleList := c.LocalRuleList
+	ruleList := slices.Clone(c.LocalRuleList)
 
 	for i := range routes {
 		if routes[i].Action == "block" {
-			ruleList = append(ruleList, api.DetectRule{
-				ID:      i,
-				Pattern: regexp.MustCompile(strings.Join(routes[i].Match, "|")),
-			})
+			if pattern := compileRule(routes[i].Match...); pattern != nil {
+				ruleList = append(ruleList, api.DetectRule{ID: routes[i].Id, Pattern: pattern})
+			}
 		}
 	}
 
 	return &ruleList, nil
+}
+
+// compileRule joins alternatives into one pattern, skipping what would break
+// the node: an invalid one used to panic (now it is dropped alone, the rest
+// still apply), and one matching the empty string (blank, ".*", "a|")
+// matches, so blocks, every destination. Each is grouped so that it cannot
+// reach into the others (a flag, an unterminated \Q).
+func compileRule(alternatives ...string) *regexp.Regexp {
+	var kept []string
+	for _, alternative := range alternatives {
+		if strings.TrimSpace(alternative) == "" {
+			continue
+		}
+		grouped := "(?:" + alternative + ")"
+		pattern, err := regexp.Compile(grouped)
+		if err != nil {
+			log.Errorf("[keeper] skip invalid audit rule %q: %v", alternative, err)
+			continue
+		}
+		if pattern.MatchString("") {
+			log.Errorf("[keeper] skip audit rule %q: it matches every destination", alternative)
+			continue
+		}
+		kept = append(kept, grouped)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return regexp.MustCompile(strings.Join(kept, "|"))
 }
 
 // ReportNodeStatus implements the API interface

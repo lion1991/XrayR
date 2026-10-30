@@ -11,7 +11,9 @@ import (
 	"time"
 
 	sbadapter "github.com/sagernet/sing-box/adapter"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 
@@ -255,6 +257,32 @@ func TestRateConnHalfCloses(t *testing.T) {
 	}
 	if _, err := limited.Read(make([]byte, 1)); err != nil {
 		t.Fatalf("the limited conn cannot read after its CloseWrite: %v", err)
+	}
+}
+
+func TestAuditTargets(t *testing.T) {
+	ip := M.ParseSocksaddr("192.0.2.1:443")
+	for _, tc := range []struct {
+		metadata sbadapter.InboundContext
+		want     []string
+	}{
+		{sbadapter.InboundContext{Network: "tcp", Destination: ip}, []string{"tcp:192.0.2.1:443"}},
+		// Both the dialed address and the sniffed domain, as a client may
+		// name an allowed domain while dialing a blocked one.
+		{sbadapter.InboundContext{Network: "tcp", Destination: ip, Domain: "example.com"}, []string{"tcp:192.0.2.1:443", "tcp:example.com:443"}},
+		{sbadapter.InboundContext{Network: "tcp", Destination: M.ParseSocksaddr("blocked.org:443"), Domain: "example.com"}, []string{"tcp:blocked.org:443", "tcp:example.com:443"}},
+		{sbadapter.InboundContext{Network: "tcp", Destination: M.ParseSocksaddr("example.com:443"), Domain: "example.com"}, []string{"tcp:example.com:443"}},
+		{sbadapter.InboundContext{Network: "udp", Destination: M.ParseSocksaddr("example.com:53")}, []string{"udp:example.com:53"}},
+		{sbadapter.InboundContext{Network: "tcp", Destination: M.ParseSocksaddr("[2001:db8::1]:80")}, []string{"tcp:[2001:db8::1]:80"}},
+		{sbadapter.InboundContext{Network: "tcp", Destination: M.SocksaddrFrom(netip.MustParseAddr("::ffff:192.0.2.1"), 80)}, []string{"tcp:192.0.2.1:80"}},
+		// UDP over TCP: Domain holds the magic name, the target is in Destination.
+		{sbadapter.InboundContext{Network: "udp", Destination: ip, Domain: uot.MagicAddress}, []string{"udp:192.0.2.1:443"}},
+		{sbadapter.InboundContext{Network: "udp", Destination: ip, Domain: uot.LegacyMagicAddress}, []string{"udp:192.0.2.1:443"}},
+		{sbadapter.InboundContext{Network: "tcp", Destination: M.ParseSocksaddr("Blocked.ORG:80"), Domain: "BLOCKED.Test"}, []string{"tcp:blocked.org:80", "tcp:blocked.test:80"}},
+	} {
+		if got := auditTargets(&tc.metadata); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("auditTargets = %q, want %q", got, tc.want)
+		}
 	}
 }
 

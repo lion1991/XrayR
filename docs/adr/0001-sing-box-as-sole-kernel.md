@@ -26,4 +26,4 @@ XrayR 同时跑 Xray-core（VMess / VLESS / Reality / Trojan / SS / Hysteria2）
 
 - wkernel 多了服务端补丁，跟随上游 alpha 同步时冲突面变大。
 - XrayR 是公开仓库但依赖私有的 wkernel，外人克隆后无法编译。
-- 面板里依赖 Xray `tcp:host:port` 匹配格式的审计规则需要调整为按域名匹配。
+- 审计沿用 Xray 的 `tcp:host:port` 匹配格式（拨号地址和 sniff 到的域名都匹配），面板规则不用调整；sing-box 节点必须开 sniff 才能按域名审计。
