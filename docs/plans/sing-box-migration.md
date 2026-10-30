@@ -28,7 +28,9 @@ Status: 草案，待确认第 1 节的决定项后实施。实施开始时把"�
    - 在用的话需要新增一个 sing-box 格式的配置项（例如 `SingBoxConfigPath`，内容合并进每个节点的 box），并且要在第 2 阶段之前做好，否则迁过去的节点会丢失分流。原来的 `geosite:` / `geoip:` 写法要改成 rule-set，sing-box 不再支持 .dat 文件。
    - 另外要决定是否**默认屏蔽访问私有 IP**（`ip_is_private` → reject）。示例 `route.json` 里屏蔽了 `geoip:private`，没配 route.json 的节点现在是不屏蔽的，用户可以借节点访问服务器本机或内网服务（比如设备数限制用的 Redis）。建议默认屏蔽。
 3. **删除用户时立即断开该用户的现有连接**。Xray 现在的行为是删除用户后已建立的连接还能继续用，直到客户端断开。建议改为立即断开。增删按 UID 判断，面板只改了限速或设备数的用户不会被断开。
-4. **CI 拉取 wkernel 的凭据**。wkernel 在私有仓库 `git.wrlog.cn`，GitHub Actions（`.github/workflows/docker.yml`）构建镜像时需要一个只读 deploy key。需要你提供并配置到 Actions secrets，具体接入方式由 S1 实现时定。
+4. **CI 拉取 wkernel 的凭据**（已定、已配好）。XrayR 继续在 GitHub Actions 构建、推 ghcr.io，不搬到 Forgejo，也不把 wkernel 镜像到 GitHub（两者都要多存一个凭据，服务器拉取地址或同步链路还得跟着变）。凭据是 Wkernel 仓库上的 deploy key `xrayr-github-ci`，**只读**：私钥存 XrayR 的 Actions secret `WKERNEL_DEPLOY_KEY`，本机副本在 `~/.ssh/wkernel_deploy`。已实测能读、写被拒。
+   - 否决：给这把 key 写权限。私钥在公开仓库的 CI 里，泄露即可往所有客户端的内核投毒；以后真要 CI 写 wkernel，另加一把 key。
+   - 待 S1 实测：GitHub 构建机能否连上 `git.wrlog.cn:2222`；连不上再改为把 wkernel 镜像到 GitHub 私有仓库。
 
 ## 2. 架构取舍（已定，供审阅）
 
