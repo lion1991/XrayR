@@ -16,8 +16,10 @@ ENV GOSUMDB=${GOSUMDB}
 ENV GOPRIVATE=git.wrlog.cn
 ENV CGO_ENABLED=0
 # wkernel is a private repository on git.wrlog.cn, reached over ssh on port 2222.
+# Only wkernel goes over ssh: the deploy key is bound to it, and Forgejo turns
+# it away from other repositories, so public ones such as sing-quic stay on https.
 COPY release/known_hosts /root/.ssh/known_hosts
-RUN git config --global url."ssh://git@git.wrlog.cn:2222/".insteadOf "https://git.wrlog.cn/"
+RUN git config --global url."ssh://git@git.wrlog.cn:2222/lion1991/Wkernel".insteadOf "https://git.wrlog.cn/lion1991/Wkernel"
 COPY . .
 # Download and build in one step, with the module cache in a cache mount: CI
 # exports every layer to the Actions cache of a public repository, so the

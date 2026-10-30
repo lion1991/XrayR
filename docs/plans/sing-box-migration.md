@@ -83,7 +83,7 @@ Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，P4 取消�
 - **S1** 把 XrayR 依赖的 sing-box 换成 wkernel（`replace`），接通 CI 拉取；加上构建 tag。验证：编译，跑 `snell_e2e_test.go` 等现有测试。
 
   已完成（XrayR `9747f06`）。在 `s1-wkernel` 分支手动触发 CI，构建通过，镜像为 `ghcr.io/lion1991/xrayr:s1-wkernel`，`latest` 没动。做法：
-  - `replace github.com/sagernet/sing-box => git.wrlog.cn/lion1991/Wkernel.git <tag>`。路径带 `.git` 后缀，Go 直接走 git，不依赖 Forgejo 的 go-get 页面；`https://git.wrlog.cn/` 由 git 的 insteadOf 改写成 `ssh://git@git.wrlog.cn:2222/`。
+  - `replace github.com/sagernet/sing-box => git.wrlog.cn/lion1991/Wkernel.git <tag>`。路径带 `.git` 后缀，Go 直接走 git，不依赖 Forgejo 的 go-get 页面；`https://git.wrlog.cn/` 由 git 的 insteadOf 改写成 `ssh://git@git.wrlog.cn:2222/`。镜像构建只改写 Wkernel 一个仓库：deploy key 只绑定 Wkernel，Forgejo 拿它读别的仓库会拒绝（哪怕是公开仓库），所以 sing-quic 等公开仓库在 CI 里走匿名 https。
   - CI 把 deploy key 装进 ssh-agent，转发给 BuildKit（`RUN --mount=type=ssh`）。主机公钥固定在 `release/known_hosts`。
   - 依赖下载和编译放在同一个 `RUN` 里，模块缓存用 cache mount：工作流把中间层导出到公开仓库的 Actions 缓存，wkernel 源码不能落进任何一层。
   - 本机开发：`scripts/verify.sh` 自带 `GOPRIVATE` 和 insteadOf 改写；直接跑 `go` 命令且模块缓存里还没有 wkernel 时，需要自己设这两项。
@@ -182,7 +182,7 @@ Status: 已定，实施中（W1、W2、S1–S4、P1–P3 已完成，P4 取消�
   - obfs（keeper 只发 salamander）、带宽直接映射到 sing-box 的 `obfs` / `up_mbps` / `down_mbps`；不认识的 obfs 类型由 sing-box 拒绝启动。ALPN 由 sing-quic 默认协商 `h3`，和 Xray 显式设置的一致。
   - 证书续期后重建 box（P1 已做）。
   - 带宽为空时用 BBR（用户决定，2026-10-30）：上游 sing-quic 在服务端上行为 0（keeper 没填）时，只要客户端声明了下行带宽就按它跑 Brutal 且不封顶，客户端填多大就发多快。改成和 Xray 一样用 BBR。只改服务端自己的发送：回给客户端的 `CC-RX` 和上游一致，客户端上传照旧按它自己的配置跑 Brutal（服务端设了下行就按下行限速）。
-    - 这个判断写死在 sing-quic 里，只靠 sing-box 配置做不到（`ignore_client_bandwidth` 会把没声明带宽的客户端直接拒掉），所以 fork 了 sing-quic（`wrlog` 分支，补丁在 `congestionFor`），仓库在 `git.wrlog.cn/lion1991/sing-quic`（公开，CI 用 wkernel 的 deploy key 走 ssh 也能只读拉取），XrayR 的 go.mod 用 replace 指过去。升级 sing-quic 时在 fork 里 rebase 这个补丁，再更新 replace 的版本。同步上游 sing-quic 时保留这个补丁。
+    - 这个判断写死在 sing-quic 里，只靠 sing-box 配置做不到（`ignore_client_bandwidth` 会把没声明带宽的客户端直接拒掉），所以 fork 了 sing-quic（`wrlog` 分支，补丁在 `congestionFor`），仓库在 `git.wrlog.cn/lion1991/sing-quic`（公开，CI 走匿名 https 拉取），XrayR 的 go.mod 用 replace 指过去。升级 sing-quic 时在 fork 里 rebase 这个补丁，再更新 replace 的版本。同步上游 sing-quic 时保留这个补丁。
     - 回归用例：fork 里的 `TestCongestionFor`；XrayR 的 `TestHysteria2NodeWithoutBandwidthStaysOnBBR`（客户端声明 1 Mbps 下行，回显 512 KiB：fork 下毫秒级，上游被 Brutal 限速要约 10s），replace 丢了它就会失败。
     - 和 Xray 仍有的差异：客户端没声明下行带宽时，Xray 照样回 `CC-RX: <服务端下行>`（为 0 时客户端上传用自己的 Brutal），sing-quic 回 `auto`，客户端上传改用 BBR。单位上 Xray 的 "N mbps" 是 N×1024×1024/8 B/s，sing-box 是 N×125000 B/s，同一个面板值低约 4.6%。
   - 上线后 sing-quic 用户表的数据竞争（见风险）进入生产：amd64 实际不出错，上 arm64 前必须修。
