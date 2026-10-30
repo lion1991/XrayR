@@ -1,6 +1,6 @@
 # 主内核从 Xray-core 迁到 sing-box（wkernel）
 
-Status: 已定，实施中（W1 已完成，下一步 W2）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
+Status: 已定，实施中（W1、W2 已完成，下一步 S1）。架构决策见 `docs/adr/0001-sing-box-as-sole-kernel.md`。
 
 ## 背景与目标
 
@@ -73,7 +73,7 @@ Status: 已定，实施中（W1 已完成，下一步 W2）。架构决策见 `d
   - vmess 的防重放表和 snell v5 的 salt 过滤器每次更新都会清空，只在列表真的变化时调用。
   - snell 入站在创建时如果没有用户，就固定为单 PSK 模式，之后不能再加用户。
   - 调用必须串行。
-- **W2** 打 `-w` tag，供 XrayR 依赖。
+- **W2** ✅ 打发布 tag `v1.15.0-alpha.13-w.1`（在 wkernel `1416c013` 上），供 XrayR 依赖。命名用 `-w.<序号>` 而不是 `-w`：wkernel 同步上游时按 `v*-w` 找上次同步点，非合并提交上的 `-w` tag 会让基线算错（规则见 wkernel `docs/wkernel-upstream-sync.md` §7）。wkernel 的 `go.mod` 没有 `replace`，可以直接当依赖模块用。
 
 ### 阶段 1：补齐 sing-box 控制器（AnyTLS / Snell 节点立即受益）
 
