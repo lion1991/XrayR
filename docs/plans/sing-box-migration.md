@@ -48,7 +48,7 @@ Status: 草案，待确认第 1 节的决定项后实施。实施开始时把"�
   - `common/limiter`、`common/rule` 里的 Xray 依赖（`errors`、`common`、`buf`）换成标准库，`rate.go` 改成包装 net.Conn / PacketConn。
   - 审计改为匹配 `metadata.Domain`。Xray 匹配的是 `tcp:host:port` 这种字符串，依赖这个格式的面板规则要调整。要拿到域名，节点必须开启路由 sniff（受 `DisableSniffing` 控制）。
   - UDP 的限制：XUDP / packetaddr 一条连接里可以有多个目标，只能按第一个目标做审计。
-- **监听和出站地址**：`ListenIP` 是 `0.0.0.0` 或空值时监听 `::`，否则 sing-box 只监听 IPv4（现在的 AnyTLS / Snell 节点很可能已经是这样，S1 要实测）。`SendIP` 是 `0.0.0.0` 时当作没设置。`DNSType` 映射到 `domain_resolver.strategy`，旧的 `domain_strategy` 已废弃。
+- **监听和出站地址**：`ListenIP` 原样传给 sing-box。所有节点目前都没有 IPv6（用户确认），`0.0.0.0` 只监听 IPv4 不影响使用，所以不做 `::` 映射；以后节点加了 IPv6 再改。`SendIP` 是 `0.0.0.0` 时当作没设置。`DNSType` 映射到 `domain_resolver.strategy`，旧的 `domain_strategy` 已废弃。
 - **构建 tag**：Reality 需要 `with_utls`，QUIC 系协议要确认是否需要 `with_quic`，gRPC 按需加 `with_grpc`。不加的话 gRPC 走 lite 实现。S1 把这些 tag 写进 Dockerfile 和验证脚本，e2e 测试也要带上。
 - **不加内核选择开关**：灰度时把新镜像先部署到一台服务器上，回滚就是重新部署旧镜像。
 - **不做的上报**：keeper 的节点状态上报和违规上报都是空实现，不往 sing-box 侧移植；删除 Xray 时连同 `common/serverstatus` 一起删掉。在线 IP 上报照做。
@@ -69,7 +69,7 @@ Status: 草案，待确认第 1 节的决定项后实施。实施开始时把"�
 
 ### 阶段 1：补齐 sing-box 控制器（AnyTLS / Snell 节点立即受益）
 
-- **S1** 把 XrayR 依赖的 sing-box 换成 wkernel（`replace`），接通 CI 拉取；加上构建 tag；监听地址改成 `::`。验证：编译，跑 `snell_e2e_test.go` 等现有测试，实测 IPv6 能连上。
+- **S1** 把 XrayR 依赖的 sing-box 换成 wkernel（`replace`），接通 CI 拉取；加上构建 tag。验证：编译，跑 `snell_e2e_test.go` 等现有测试。
 - **S2** 用户热更新：定时拉取用户列表，按 UID 区分增删和属性变化，属性变化只更新 limiter。节点信息变化时重建 box。每次拉取时刷新 jitter（现在只在启动时读一次）。决定 3 要的断开放到 S3 做，因为需要连接登记表。
 - **S3** 管控：包装出站（设备数、限速、审计）；连接追踪器负责流量计数和连接登记；删除用户时断开现有连接；在线 IP 按存活连接统计并上报（现在只统计新建连接，长连接用户会漏报）；定时拉取审计规则；自动限速。把 `singbox_traffic.go` 里每条连接一条的 Info 日志降级，UDP 日志里写死的 "AnyTLS" 也改掉。
 - **S4** 出站和日志：`SendIP`、`DNSType`、默认路由 sniff、日志级别和错误日志映射（现在 sing-box 控制器把日志整个关掉了）；按决定 2 处理私有 IP 屏蔽。
