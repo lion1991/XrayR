@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -151,14 +152,23 @@ func (f *fakeSnellAPI) reportCount() int {
 	return len(f.reported)
 }
 
+// freePort is free for both TCP and UDP, since most nodes listen on both.
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
+	for range 100 {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve port: %v", err)
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		_ = l.Close()
+		if u, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port))); err == nil {
+			_ = u.Close()
+			return port
+		}
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
+	t.Fatal("no port free for both TCP and UDP")
+	return 0
 }
 
 // startEchoServer is the origin the proxied connection is routed to, so the

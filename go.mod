@@ -18,7 +18,8 @@ require (
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/sagernet/sing v0.9.7-0.20261023115510-03a6cce64bf7
 	github.com/sagernet/sing-box v1.15.0-alpha.3
-	github.com/sagernet/sing-shadowsocks v0.2.9
+	github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e
+	github.com/sagernet/sing-shadowsocks2 v0.2.2-0.20260929152114-a69d1086332b
 	github.com/sagernet/sing-snell v0.0.0-20260904135315-bc5a12ac736f
 	github.com/sagernet/sing-tun v0.9.7-0.20261028024126-5b0a1a7a394e
 	github.com/shirou/gopsutil/v3 v3.24.5

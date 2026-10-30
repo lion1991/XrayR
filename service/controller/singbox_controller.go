@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"maps"
@@ -27,6 +28,7 @@ import (
 	sbanytls "github.com/sagernet/sing-box/protocol/anytls"
 	sbhysteria "github.com/sagernet/sing-box/protocol/hysteria"
 	sbhysteria2 "github.com/sagernet/sing-box/protocol/hysteria2"
+	sbshadowsocks "github.com/sagernet/sing-box/protocol/shadowsocks"
 	sbsnell "github.com/sagernet/sing-box/protocol/snell"
 	sbtrojan "github.com/sagernet/sing-box/protocol/trojan"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -266,8 +268,8 @@ func (c *SingBoxController) Close() error {
 // sync leaves the desired state in place, so the next poll retries it.
 func (c *SingBoxController) sync() error {
 	nodeInfo := c.nodeInfo
-	users, secrets, warnings := validUsers(*c.userList)
-	c.trackCredentials(users, secrets)
+	users, secrets, warnings := validUsers(*c.userList, nodeSecret(nodeInfo))
+	c.trackCredentials(users)
 	// Limits change without touching the inbound.
 	c.guard.setPolicies(nodeInfo.SpeedLimit, users)
 	needUsers := nodeNeedsUsers(nodeInfo)
@@ -300,6 +302,10 @@ func (c *SingBoxController) sync() error {
 		c.logger.Print(err)
 		nodeInfo = c.boxNode
 		needUsers = nodeNeedsUsers(nodeInfo)
+		// The old box may take its keys differently (another SS method), and
+		// may serve users the new node info skipped.
+		users, secrets, _ = validUsers(*c.userList, nodeSecret(nodeInfo))
+		c.trackCredentials(users)
 	}
 	if !needUsers {
 		return nil
@@ -382,6 +388,12 @@ func (c *SingBoxController) updateInboundUsers(nodeInfo *api.NodeInfo, tag strin
 		return replaceUsers(inbound, inboundUsers(names, secrets, snellUser))
 	case "trojan":
 		return replaceUsers(inbound, inboundUsers(names, secrets, trojanUser))
+	case "shadowsocks":
+		managed, ok := inbound.(sbadapter.ManagedSSMServer)
+		if !ok {
+			return errUsersNotReplaceable
+		}
+		return managed.UpdateUsers(names, secrets)
 	}
 	return errUsersNotReplaceable
 }
@@ -421,14 +433,18 @@ type credential struct {
 
 // trackCredentials bumps the version of every uid whose secret changed.
 // Versions are kept for removed uids too, so a uid coming back with another
-// secret does not reuse a name an old session may still hold.
-func (c *SingBoxController) trackCredentials(users []api.UserInfo, secrets []string) {
-	for i, user := range users {
+// secret does not reuse a name an old session may still hold. It tracks the
+// panel's secret, not the key derived from it: a key changes with the SS
+// method too, and the method change it follows may be rejected while the old
+// box keeps serving.
+func (c *SingBoxController) trackCredentials(users []api.UserInfo) {
+	for _, user := range users {
+		secret := userSecret(&user)
 		known, loaded := c.credentials[user.UID]
 		if !loaded {
-			c.credentials[user.UID] = credential{secret: secrets[i]}
-		} else if known.secret != secrets[i] {
-			c.credentials[user.UID] = credential{secret: secrets[i], version: known.version + 1}
+			c.credentials[user.UID] = credential{secret: secret}
+		} else if known.secret != secret {
+			c.credentials[user.UID] = credential{secret: secret, version: known.version + 1}
 		}
 	}
 }
@@ -491,15 +507,17 @@ func diffUsers(old, new map[string]string) (added, removed int) {
 // Dropping them keeps one bad entry from failing the whole update, which
 // replaces all users or none.
 //   - The secret is the password, falling back to the UUID; without one the
-//     user cannot authenticate.
+//     user cannot authenticate. secretOf derives the key a node takes from it
+//     and rejects one the node cannot use.
 //   - A UID listed twice would give two users the same name.
 //   - Users sharing a secret are indistinguishable to the inbound, so one
 //     would be billed for the other; all of them are dropped. sing-anytls and
 //     sing-quic would silently keep the last one.
-func validUsers(users []api.UserInfo) (valid []api.UserInfo, secrets []string, skipped []string) {
+func validUsers(users []api.UserInfo, secretOf func(secret string) (string, error)) (valid []api.UserInfo, secrets []string, skipped []string) {
 	seenUIDs := make(map[int]bool, len(users))
 	owners := make(map[string][]int, len(users))
 	candidates := make([]api.UserInfo, 0, len(users))
+	candidateSecrets := make([]string, 0, len(users))
 	for _, user := range users {
 		if seenUIDs[user.UID] {
 			skipped = append(skipped, fmt.Sprintf("skip user: uid %d is listed more than once", user.UID))
@@ -511,11 +529,17 @@ func validUsers(users []api.UserInfo) (valid []api.UserInfo, secrets []string, s
 			skipped = append(skipped, fmt.Sprintf("skip user: uid %d has empty password/uuid", user.UID))
 			continue
 		}
+		secret, err := secretOf(secret)
+		if err != nil {
+			skipped = append(skipped, fmt.Sprintf("skip user: uid %d: %s", user.UID, err))
+			continue
+		}
 		owners[secret] = append(owners[secret], user.UID)
 		candidates = append(candidates, user)
+		candidateSecrets = append(candidateSecrets, secret)
 	}
-	for _, user := range candidates {
-		secret := userSecret(&user)
+	for i, user := range candidates {
+		secret := candidateSecrets[i]
 		if uids := owners[secret]; len(uids) > 1 {
 			if uids[0] == user.UID {
 				skipped = append(skipped, fmt.Sprintf("skip users: uids %v share the same password/uuid", uids))
@@ -533,6 +557,40 @@ func userSecret(user *api.UserInfo) string {
 		return user.Passwd
 	}
 	return user.UUID
+}
+
+// nodeSecret returns how the node turns a user's secret into its key. A
+// Shadowsocks 2022 user key is the password (keeper's is the uuid) cut to the
+// key size and base64 encoded, the derivation Xray used for keeper.
+func nodeSecret(nodeInfo *api.NodeInfo) func(secret string) (string, error) {
+	keySize := 0
+	if strings.EqualFold(nodeInfo.NodeType, "shadowsocks") {
+		keySize = ss2022KeySize(ssMethod(nodeInfo))
+	}
+	return func(secret string) (string, error) {
+		if keySize == 0 {
+			return secret, nil
+		}
+		if len(secret) < keySize {
+			return "", fmt.Errorf("a shadowsocks 2022 key needs %d bytes of password/uuid, got %d", keySize, len(secret))
+		}
+		return base64.StdEncoding.EncodeToString([]byte(secret[:keySize])), nil
+	}
+}
+
+func ssMethod(nodeInfo *api.NodeInfo) string {
+	return strings.ToLower(nodeInfo.CypherMethod)
+}
+
+// ss2022KeySize is 0 for a method that is not Shadowsocks 2022.
+func ss2022KeySize(method string) int {
+	switch method {
+	case "2022-blake3-aes-128-gcm":
+		return 16
+	case "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305":
+		return 32
+	}
+	return 0
 }
 
 func inboundUsers[U any](names, secrets []string, build func(name, secret string) U) []U {
@@ -559,6 +617,10 @@ func trojanUser(name, secret string) sboption.TrojanUser {
 	return sboption.TrojanUser{Name: name, Password: secret}
 }
 
+func ssUser(name, secret string) sboption.ShadowsocksUser {
+	return sboption.ShadowsocksUser{Name: name, Password: secret}
+}
+
 func snellUser(name, secret string) sboption.SnellUser {
 	return sboption.SnellUser{Name: name, UserKey: secret}
 }
@@ -568,7 +630,7 @@ func snellUser(name, secret string) sboption.SnellUser {
 func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, secrets []string) (*sb.Box, error) {
 	nodeType := strings.ToLower(nodeInfo.NodeType)
 	switch nodeType {
-	case "anytls", "hysteria", "snell", "trojan":
+	case "anytls", "hysteria", "shadowsocks", "snell", "trojan":
 	default:
 		return nil, fmt.Errorf("unsupported node type for sing-box controller: %s", nodeInfo.NodeType)
 	}
@@ -698,6 +760,34 @@ func (c *SingBoxController) newBox(nodeInfo *api.NodeInfo, tag string, names, se
 			},
 			Users: inboundUsers(names, secrets, trojanUser),
 		}
+	case "shadowsocks":
+		// keeper sends obfs=http as a TCP header; sing-box has no server side
+		// for it.
+		if len(nodeInfo.Header) > 0 {
+			return nil, errors.New("shadowsocks: obfs is not supported on sing-box nodes")
+		}
+		method := ssMethod(nodeInfo)
+		ssOptions := &sboption.ShadowsocksInboundOptions{
+			ListenOptions: lo,
+			Method:        method,
+			Users:         inboundUsers(names, secrets, ssUser),
+		}
+		switch {
+		case method == "2022-blake3-chacha20-poly1305":
+			// sing-box only says "invalid argument".
+			return nil, errors.New("shadowsocks: 2022-blake3-chacha20-poly1305 has no multi-user mode, use an aes method")
+		case ss2022KeySize(method) > 0:
+			// sing-shadowsocks derives a key from a longer one; clients take only
+			// the exact size.
+			serverKey, err := base64.StdEncoding.DecodeString(nodeInfo.ServerKey)
+			if err != nil || len(serverKey) != ss2022KeySize(method) {
+				return nil, fmt.Errorf("shadowsocks: %s needs a base64 server key of %d bytes", method, ss2022KeySize(method))
+			}
+			ssOptions.Password = nodeInfo.ServerKey
+		}
+		sbshadowsocks.RegisterInbound(inReg)
+		inboundType = sbc.TypeShadowsocks
+		inboundOptions = ssOptions
 	case "snell":
 		sbsnell.RegisterInbound(inReg)
 		version := nodeInfo.SnellVersion
@@ -970,7 +1060,7 @@ func (c *SingBoxController) reloadQUICCertificate() {
 	if c.closed || c.box == nil || !strings.EqualFold(c.boxNode.NodeType, "hysteria") {
 		return
 	}
-	users, secrets, _ := validUsers(*c.userList)
+	users, secrets, _ := validUsers(*c.userList, nodeSecret(c.boxNode))
 	if err := c.rebuild(c.boxNode, users, secrets); err != nil {
 		c.logger.Error(err)
 	}

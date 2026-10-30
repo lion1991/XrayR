@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net"
@@ -35,7 +36,7 @@ func TestValidUsers(t *testing.T) {
 		// secret, which would bill one user's traffic to the other.
 		{UID: 4, Passwd: "same"},
 		{UID: 5, UUID: "same"},
-	})
+	}, nodeSecret(&api.NodeInfo{NodeType: "AnyTLS"}))
 	var uids []int
 	for _, user := range valid {
 		uids = append(uids, user.UID)
@@ -68,7 +69,10 @@ func TestUserNamesFollowCredentialChanges(t *testing.T) {
 	c := &SingBoxController{credentials: make(map[int]credential)}
 	users := []api.UserInfo{{UID: 1, Email: "a@test"}, {UID: 2, Email: "b@test"}}
 	names := func(secrets ...string) []string {
-		c.trackCredentials(users[:len(secrets)], secrets)
+		for i, secret := range secrets {
+			users[i].Passwd = secret
+		}
+		c.trackCredentials(users[:len(secrets)])
 		return c.userNames("Snell_0.0.0.0_443", users[:len(secrets)])
 	}
 	first := names("p1", "p2")
@@ -607,5 +611,40 @@ func TestGuardRejectsPrivateTargets(t *testing.T) {
 		if err := h.checkTarget(&metadata); (err != nil) != test.private {
 			t.Errorf("%s (resolved %v): got %v, want private %v", test.destination, test.resolved, err, test.private)
 		}
+	}
+}
+
+// Shadowsocks 2022 keys come from the uuid as Xray derived them for keeper;
+// a key two users end up sharing, or one too short, drops them.
+func TestValidUsersDerivesShadowsocks2022Keys(t *testing.T) {
+	const uuid = "8d9c1c2e-7a4b-4f3e-9b6a-2c1d0e9f8a7b"
+	users := []api.UserInfo{
+		{UID: 1, UUID: uuid},
+		{UID: 2, UUID: "short"},
+		{UID: 3, UUID: uuid[:16] + "-differs-later-on"},
+	}
+	ss := func(method string) *api.NodeInfo {
+		return &api.NodeInfo{NodeType: "Shadowsocks", CypherMethod: method}
+	}
+
+	valid, secrets, skipped := validUsers(users, nodeSecret(ss("2022-blake3-aes-256-gcm")))
+	want := base64.StdEncoding.EncodeToString([]byte(uuid[:32]))
+	if len(valid) != 2 || valid[0].UID != 1 || secrets[0] != want {
+		t.Fatalf("aes-256: valid %v, secrets %q, want uid 1 keyed %q first", valid, secrets, want)
+	}
+	if len(skipped) != 1 {
+		t.Errorf("aes-256: skipped %q, want the short uuid", skipped)
+	}
+
+	// 128-bit keys take the first 16 bytes, which uids 1 and 3 share.
+	valid, _, skipped = validUsers(users, nodeSecret(ss("2022-blake3-aes-128-gcm")))
+	if len(valid) != 0 || len(skipped) != 2 {
+		t.Errorf("aes-128: valid %v, skipped %q, want nobody left", valid, skipped)
+	}
+
+	// A legacy AEAD password is the uuid itself.
+	_, secrets, _ = validUsers(users[:1], nodeSecret(ss("aes-128-gcm")))
+	if secrets[0] != uuid {
+		t.Errorf("aes-128-gcm: secret %q, want the uuid", secrets[0])
 	}
 }

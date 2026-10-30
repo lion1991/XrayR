@@ -20,3 +20,7 @@ func (c *SingBoxController) BoxGeneration() int {
 
 // ReloadQUICCertificate is what certMonitor runs after a renewal.
 func (c *SingBoxController) ReloadQUICCertificate() { c.reloadQUICCertificate() }
+
+// PollPanel is one round of the panel poll, once UpdatePeriodic has passed
+// since the start.
+func (c *SingBoxController) PollPanel() error { return c.nodeInfoMonitor() }
