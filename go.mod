@@ -334,3 +334,5 @@ require (
 )
 
 replace github.com/sagernet/sing-box => git.wrlog.cn/lion1991/Wkernel.git v1.15.0-alpha.13-w.1
+
+replace github.com/sagernet/sing-quic => git.wrlog.cn/lion1991/sing-quic.git v0.0.0-20261030111027-6fe0a1bff806

@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -187,12 +186,8 @@ func echoDuration(t *testing.T, nodeAddr string, receiveBPS uint64, echo string,
 // A node whose panel leaves the upload bandwidth empty sends on BBR, as Xray
 // did, instead of Brutal at whatever rate a client declares. Upstream sing-quic
 // paces this echo by Brutal at the declared 1 Mbps, around 10s on loopback;
-// BBR takes milliseconds. This needs the wrlog fork of sing-quic.
+// BBR takes milliseconds. go.mod replaces sing-quic with the wrlog fork for this.
 func TestHysteria2NodeWithoutBandwidthStaysOnBBR(t *testing.T) {
-	if os.Getenv("XRAYR_SING_QUIC_FORK") == "" {
-		// This fails until go.mod replaces sing-quic with the fork.
-		t.Skip("needs the wrlog sing-quic fork; set XRAYR_SING_QUIC_FORK=1 to run")
-	}
 	echo := startEchoServer(t)
 	_, _, nodeAddr := startHysteriaNode(t, nil)
 	if elapsed := echoDuration(t, nodeAddr, 125_000, echo, 512<<10); elapsed > 2*time.Second {
